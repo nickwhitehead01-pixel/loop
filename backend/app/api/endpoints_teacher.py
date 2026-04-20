@@ -1,13 +1,15 @@
 """
-Teacher endpoints — lesson management + analytics dashboard.
+Teacher endpoints — lesson management, analytics, chat assistant, and live transcription.
 
-POST /teacher/lessons                         — upload lesson (PDF/DOCX/PPTX/TXT)
-GET  /teacher/lessons                         — list uploaded lessons
-GET  /teacher/lessons/{lesson_id}             — lesson detail with summary
-GET  /teacher/sessions                        — list all sessions
-GET  /teacher/sessions/{session_id}/analytics — aggregated pupil performance
-GET  /teacher/students                        — list all pupils
-GET  /teacher/students/{pupil_id}/progress    — per-pupil history across sessions
+POST /teacher/lessons                              — upload lesson (PDF/DOCX/PPTX/TXT)
+GET  /teacher/lessons                              — list uploaded lessons
+GET  /teacher/lessons/{lesson_id}                  — lesson detail with summary
+GET  /teacher/sessions                             — list all sessions
+GET  /teacher/sessions/{session_id}/analytics      — aggregated pupil performance
+GET  /teacher/students                             — list all pupils
+GET  /teacher/students/{pupil_id}/progress         — per-pupil history across sessions
+WS   /teacher/ws/{teacher_id}/chat                 — streaming AI chat assistant
+WS   /teacher/ws/{teacher_id}/transcribe/{session_id} — live classroom transcription (Whisper)
 """
 from __future__ import annotations
 
@@ -23,6 +25,7 @@ from app.agents.teacher_graph import run_teacher_agent
 from app.agents.teacher_rag import process_lesson, summarise_lesson
 from app.core.config import settings
 from app.core.database import get_db
+from app.services import transcription
 from app.models.domain import (
     Conversation,
     Lesson,
@@ -33,6 +36,7 @@ from app.models.domain import (
     QuizQuestion,
     Role,
     TeacherConversation,
+    TranscriptChunk,
     User,
 )
 from app.models.schemas import (
@@ -343,4 +347,91 @@ async def teacher_chat(
 
     except WebSocketDisconnect:
         logger.info("Teacher %d disconnected", teacher_id)
+
+
+# ---------------------------------------------------------------------------
+# Teacher live transcription — WebSocket (Phase 8+)
+# ---------------------------------------------------------------------------
+
+@router.websocket("/ws/{teacher_id}/transcribe/{session_id}")
+async def teacher_transcribe(
+    websocket: WebSocket,
+    teacher_id: int,
+    session_id: int,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Live transcription for the teacher's classroom speech.
+
+    Client sends binary audio chunks via WebSocket.
+    Server streams back transcript results as JSON:
+        {"type": "transcript", "text": "...", "language": "en", "timestamp_ms": 5000}
+
+    Used during live lessons — teacher's voice is transcribed, embedded,
+    and stored in TranscriptChunk for all pupils' agents to search/reference.
+    """
+    await websocket.accept()
+    logger.info("Teacher %d starting live transcription for session %d", teacher_id, session_id)
+
+    try:
+        while True:
+            message = await websocket.receive()
+
+            # Binary audio chunk
+            if "bytes" in message and message["bytes"]:
+                audio_bytes = message["bytes"]
+                try:
+                    result = await transcription.transcribe_chunk(audio_bytes)
+                    logger.info(
+                        "Transcribed [lang=%s]: %.60s",
+                        result.language,
+                        result.text,
+                    )
+
+                    # Embed and store in TranscriptChunk
+                    if result.text.strip():
+                        from app.services import ollama_client
+
+                        vector = await ollama_client.embed(result.text)
+                        chunk = TranscriptChunk(
+                            session_id=session_id,
+                            content=result.text,
+                            embedding=vector,
+                            timestamp_ms=0,  # TODO: track cumulative timestamp
+                        )
+                        db.add(chunk)
+                        await db.flush()
+
+                        # Send back to teacher (and eventually broadcast to pupils)
+                        await websocket.send_json({
+                            "type": "transcript",
+                            "text": result.text,
+                            "language": result.language,
+                            "timestamp_ms": 0,
+                        })
+                    else:
+                        await websocket.send_json({
+                            "type": "silent",
+                            "message": "[silence detected]",
+                        })
+
+                except Exception as exc:
+                    logger.error("Transcription error: %s", exc)
+                    await websocket.send_json({"type": "error", "detail": str(exc)})
+                    await db.rollback()
+
+            # Text message: control command (optional)
+            elif "text" in message:
+                try:
+                    data = json.loads(message["text"])
+                    if data.get("type") == "end_session":
+                        await db.commit()
+                        await websocket.send_json({"type": "session_ended"})
+                        break
+                except (json.JSONDecodeError, KeyError):
+                    pass
+
+    except WebSocketDisconnect:
+        await db.commit()
+        logger.info("Teacher %d stopped transcribing session %d", teacher_id, session_id)
 
