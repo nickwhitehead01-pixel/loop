@@ -211,6 +211,27 @@ Open http://localhost:8765 — record your voice, get a live transcript, ask Gem
 
 ---
 
+## Development Guidelines
+
+**Branching & commits:**
+- Always create a feature branch before making changes: `git checkout -b feature/your-feature-name`
+- **Do not commit to `main` unless explicitly instructed**
+- Commit messages should be clear and descriptive (e.g., `Add semantic cache to pupil agent`)
+- Push your feature branch and create a Pull Request for review
+- Only merge to `main` after review and approval
+
+**Example workflow:**
+```bash
+git checkout -b feature/new-endpoint
+# Make changes
+git add .
+git commit -m "Add new WebSocket endpoint"
+git push origin feature/new-endpoint
+# Create PR on GitHub
+```
+
+---
+
 ## License
 
 [Creative Commons Attribution 4.0 International (CC-BY 4.0)](LICENSE)
