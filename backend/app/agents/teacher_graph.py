@@ -1,7 +1,7 @@
 """
 Teacher agent — a ReAct-style LangGraph StateGraph.
 
-    Model:   gemma4:e4b
+    Model:   gemma4:e2b
     Tools:   search_lesson_content | get_class_analytics | get_student_profile
              | get_teacher_memories | search_transcript
 

@@ -2,10 +2,10 @@
 Teacher RAG pipeline.
 
 Not a LangGraph graph — this is a sequential pipeline (no decision loop
-needed). It uses gemma3:12b for reasoning on structured document analysis.
+needed). It uses gemma4:e2b for reasoning on structured document analysis.
 
 process_lesson   — ingest PDF bytes into pgvector
-summarise_lesson — fetch all chunks → gemma3:12b → structured summary
+summarise_lesson — fetch all chunks → gemma4:e2b → structured summary
 """
 from __future__ import annotations
 
@@ -56,7 +56,7 @@ async def summarise_lesson(
     db: AsyncSession,
 ) -> str:
     """
-    Fetch all chunks for *lesson_id*, concatenate them, and ask gemma3:12b
+    Fetch all chunks for *lesson_id*, concatenate them, and ask gemma4:e2b
     to produce a structured lesson summary.
     Returns the summary as a string.
     """
@@ -70,7 +70,7 @@ async def summarise_lesson(
     if not chunks:
         return "No content found for this lesson."
 
-    # Concatenate all chunks — gemma3:12b has a 128K context window
+    # Concatenate all chunks — gemma4:e2b has a 32K context window
     full_text = "\n\n".join(chunks)
 
     # Truncate to ~12 000 chars to stay safely within context limits

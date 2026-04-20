@@ -28,7 +28,7 @@ Rules that affect this build:
   - Winning license: CC-BY 4.0 (add LICENSE file to repo)
   - Winners must provide: code repo + full reproduction instructions
     + architecture description. README.md IS judged.
-  - Must use Gemma 4 (gemma4:e4b via Ollama) ✓
+  - Must use Gemma 4 (gemma4:e2b via Ollama) ✓
   - All dependencies must be OSI-approved open source licenses ✓
   - "Multi-tool agents" is explicit wording in the Education track —
     frame the pupil agent as having multiple tools (RAG retrieval,
@@ -79,7 +79,7 @@ Four-Node Architecture:
 Stack:
   - Backend:    FastAPI + LangGraph (Python)
   - Database:   PostgreSQL + pgvector
-  - LLM:        Ollama (local) — gemma4:e4b
+  - LLM:        Ollama (local) — gemma4:e2b
   - Embeddings: nomic-embed-text
   - STT:        faster-whisper (CPU, int8)
   - Hub OS:     Windows (Docker Desktop)
@@ -87,8 +87,8 @@ Stack:
   - Discovery:  mDNS / Bonjour / ZeroConf
 
 Model Strategy:
-  - Primary:  gemma4:e4b  (pupil chat + teacher RAG, strong reasoning, low latency)
-  - Fallback: gemma4:e2b  (memory-constrained hardware, 8 GB RAM)
+  - Primary:  gemma4:e2b  (pupil chat + teacher RAG, good balance of capability & memory)
+  - Fallback: gemma4:e2b  (same as primary for consistency)
   - Embeddings: nomic-embed-text (768-dim, fully local)
   - STT:        faster-whisper tiny/small (CPU, int8, real-time)
 
@@ -146,7 +146,7 @@ PHASE 3 — SERVICES                                             [DONE]
 
   ✓ services/summary.py                                    [NEW FILE]
       generate_session_artifacts(session_id) — background task entry
-      _generate_quiz_questions() — 3-5 JSON quiz Q&A via gemma3:12b
+      _generate_quiz_questions() — 3-5 JSON quiz Q&A via gemma4:e2b
       _generate_pupil_summary() — per-pupil summary with
         understanding_score, key_topics, topics_discussed
       Uses own AsyncSessionLocal() since it runs as background task
@@ -175,7 +175,7 @@ PHASE 4 — PUPIL AGENT (LangGraph)                              [DONE]
       SHORT-TERM: Sliding window of last N messages from conversations
         table, loaded each turn (configurable via memory_window setting)
       LONG-TERM: pupil_memories table — atomic facts embedded with
-        nomic-embed-text. After every response, gemma3:12b extracts
+        nomic-embed-text. After every response, gemma4:e2b extracts
         1-3 facts (struggles, preferences, progress) → embeds → stores.
         On next turn, relevant memories loaded by similarity search
         + 20 most recent injected into system prompt.
@@ -186,7 +186,7 @@ PHASE 5 — TEACHER RAG PIPELINE                                 [DONE]
 
   ✓ agents/teacher_rag.py — sequential pipeline (no graph):
       process_lesson() — ingest PDF bytes via vector_store
-      summarise_lesson() — concatenate chunks → gemma3:12b → summary
+      summarise_lesson() — concatenate chunks → gemma4:e2b → summary
 
   NOTE: Teacher has NO memory (short-term or long-term). It is a
   stateless pipeline. See Phase 7 for planned improvements.
@@ -260,7 +260,7 @@ This phase adds short-term and long-term memory to match the pupil agent.
   - Stores cross-session facts about the teacher's preferences, class
     dynamics, which explanations worked, recurring pupil issues
   - After each teacher conversation turn, extract 1-3 facts via
-    gemma3:12b (same pattern as pupil memory extraction)
+    gemma4:e2b (same pattern as pupil memory extraction)
   - Similarity retrieval on each turn to personalise responses
 
 7c. Teacher agent graph (new: agents/teacher_graph.py)
@@ -359,7 +359,7 @@ PHASE 9 — WINDOWS HUB LAUNCHER                                [TODO]
 
   - Single .exe installer (e.g. Inno Setup or NSIS)
   - Bundled: Docker Desktop check / install prompt, Ollama install
-  - On launch: docker-compose up + ollama pull gemma4:e4b
+  - On launch: docker-compose up + ollama pull gemma4:e2b
   - System tray icon with status (running / stopped / error)
   - Displays local IP + mDNS hostname for IT reference
   - One-click stop/start
@@ -374,7 +374,7 @@ COMPETITION SUBMISSION CHECKLIST
         - Special education problem statement (judge framing)
         - Privacy/compliance table (FERPA/GDPR/IEP/COPPA)
         - Quick start: Hub setup + PoC run instructions
-        - How gemma4:e4b is used and why (Ollama track)
+        - How gemma4:e2b is used and why (Ollama track)
         - Screenshot or demo GIF of pupil chat + teacher companion
   [ ] Kaggle notebook or writeup submitted alongside code
   [ ] All dependencies are OSI-approved open source
@@ -391,7 +391,7 @@ DECISIONS & SCOPE
   - No authentication in v1 (IDs passed in URL/body; add JWT later)
   - pgvector on same Postgres instance (no separate Chroma container)
   - No internet required — fully air-gapped by design
-  - gemma4:e4b for all LLM tasks (both agents); e2b as fallback
+  - gemma4:e2b for all LLM tasks (both agents)
   - nomic-embed-text for all embeddings (768-dim)
   - faster-whisper tiny/small for local STT (CPU, int8 quantisation)
   - Frame pupil agent as multi-tool (retrieval + memory + lesson +

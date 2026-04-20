@@ -1,9 +1,9 @@
 """
-PoC: Mac Mic → faster-whisper (live transcript) + manual question → Gemma4:e4b response
+PoC: Mac Mic → faster-whisper (live transcript) + manual question → Gemma4:e2b response
 
 Flow:
   1. Teacher speaks → Whisper transcribes → transcript shown on screen
-  2. Student types a question → Gemma4:e4b answers it (streamed)
+  2. Student types a question → Gemma4:e2b answers it (streamed)
 
 Run:
     python poc/poc_whisper_gemma.py
@@ -125,7 +125,7 @@ HTML = """<!DOCTYPE html>
 </head>
 <body>
   <h1>Whisper - Gemma PoC</h1>
-  <p class="subtitle">Teacher speaks - Whisper transcribes. Student types a question - Gemma 4 (9b) answers.</p>
+  <p class="subtitle">Teacher speaks - Whisper transcribes. Student types a question - Gemma 4 (7b) answers.</p>
 
   <div class="section-label">Live Transcript (Whisper)</div>
   <div class="transcript-panel muted" id="transcript">Transcript will appear here as you record...</div>

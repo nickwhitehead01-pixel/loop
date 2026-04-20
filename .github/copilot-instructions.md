@@ -41,7 +41,7 @@ user = db.query(User).filter(User.id == user_id).first()
 
 ### Models
 - Config values come from `settings` — never hardcode model names, URLs, or paths
-- Pupil model: `settings.ollama_model_pupil` (`gemma4:e4b`)
+- Pupil model: `settings.ollama_model_pupil` (`gemma4:e2b`)
 - Teacher model: `settings.ollama_model_teacher` (`gemma4:27b`)
 - Embed model: `settings.ollama_embed_model` (`nomic-embed-text`)
 
@@ -51,7 +51,7 @@ from app.core.config import settings
 model = settings.ollama_model_pupil
 
 # wrong
-model = "gemma4:e4b"
+model = "gemma4:e2b"
 ```
 
 ### LLM / Ollama
@@ -83,7 +83,7 @@ httpx.post("http://localhost:11434/...")  # never inline httpx for Ollama
 - `load_all_pupil_memories_func` loads the last 20 memories at session start — injected into the system prompt via `build_system_prompt(memories)`
 - `get_pupil_memories_func` does pgvector similarity search — available as an agent tool
 - `save_pupil_memories_func` persists new facts extracted post-turn
-- Memory extraction runs after every turn using `gemma4:e4b` — returns a JSON array of strings
+- Memory extraction runs after every turn using `gemma4:e2b` — returns a JSON array of strings
 - Failures in memory extraction must never raise — always wrapped in `try/except`
 - Never load all memories into context blindly — use similarity search (`get_pupil_memories`) for mid-conversation recall
 

@@ -30,7 +30,7 @@ The system is a four-node Edge AI ecosystem that runs entirely on a school's exi
 │   │                                                          │              │
 │   │  ┌─────────────┐  ┌──────────────┐  ┌────────────────┐  │              │
 │   │  │   Ollama    │  │   FastAPI    │  │  PostgreSQL    │  │              │
-│   │  │  gemma4:e4b │  │  + LangGraph │  │  + pgvector    │  │              │
+│   │  │  gemma4:e2b │  │  + LangGraph │  │  + pgvector    │  │              │
 │   │  │  (local GPU)│  │  (reasoning) │  │  (memory + RAG)│  │              │
 │   │  └─────────────┘  └──────────────┘  └────────────────┘  │              │
 │   │                                                          │              │
@@ -154,7 +154,7 @@ The cache is **lesson-scoped** — it resets when a new lesson session starts, s
 
 | Model | Used for | Why |
 |-------|----------|-----|
-| `gemma4:e4b` | Pupil chat + Teacher RAG (real-time streaming) | Strong reasoning, low latency, runs on school hardware without a dedicated GPU |
+| `gemma4:e2b` | Pupil chat + Teacher RAG (real-time streaming) | Strong reasoning, memory-efficient (~7.2 GB), runs on school hardware without a dedicated GPU |
 | `gemma4:e2b` | Fallback for memory-constrained hardware | Fits on 8 GB RAM, still capable for single-turn Q&A |
 | `nomic-embed-text` | pgvector embeddings (RAG + memory retrieval) | Fast, 768-dim vectors, fully local |
 | `faster-whisper` (tiny/small) | Live classroom speech-to-text | Runs on CPU, real-time on-device |
@@ -170,7 +170,7 @@ git clone <repo-url>
 cd gemma-education-platform
 
 # Pull models
-ollama pull gemma4:e4b
+ollama pull gemma4:e2b
 ollama pull nomic-embed-text
 
 # Start the backend stack

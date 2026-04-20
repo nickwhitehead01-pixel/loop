@@ -74,7 +74,7 @@ async def generate_stream(
 
     Args:
         messages: list of {"role": "user"|"assistant", "content": "..."}
-        model:    ollama model tag, e.g. "gemma3:12b"
+        model:    ollama model tag, e.g. "gemma4:e2b"
         system:   optional system prompt (prepended automatically)
         format:   optional output format, e.g. "json" to force valid JSON
     """

@@ -1,7 +1,7 @@
 """
 Pupil agent — a ReAct-style LangGraph StateGraph.
 
-    Model:   gemma4:e4b
+    Model:   gemma4:e2b
     Tools:   retrieve_context | get_conversation_history | list_lessons
 
 Graph structure:
@@ -259,7 +259,7 @@ async def run_pupil_agent(
             await db.flush()
 
         # --- Long-term memory extraction ---
-        # Ask gemma3:12b to distill 1-3 new facts from this turn.
+        # Ask gemma4:e2b to distill 1-3 new facts from this turn.
         # Failures must never prevent commit.
         try:
             import json as _json
