@@ -1,0 +1,16 @@
+FROM node:22-alpine
+
+WORKDIR /app
+
+# Install dependencies first (layer cache)
+COPY package.json package-lock.json* ./
+RUN npm install
+
+# Copy source
+COPY . .
+
+EXPOSE 3000
+
+# Hot reload in development
+CMD ["npm", "run", "dev"]
+

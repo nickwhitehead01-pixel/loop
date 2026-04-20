@@ -1,0 +1,114 @@
+services:
+
+  # ── PostgreSQL + pgvector ──────────────────────────────────────────
+  postgres:
+    image: ankane/pgvector:latest
+    container_name: gemma_edu_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: gemma_user
+      POSTGRES_PASSWORD: gemma_password
+      POSTGRES_DB: gemma_education
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gemma_user -d gemma_education"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Ollama (local LLM server) ──────────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    container_name: gemma_edu_ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:11434/api/tags || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  # ── Model puller: pulls all required models then exits ─────────────
+  # Runs once on first `docker-compose up`. Skipped on subsequent
+  # runs because the models are persisted in the ollama_data volume.
+  ollama-pull:
+    image: ollama/ollama:latest
+    container_name: gemma_edu_ollama_pull
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+    entrypoint: >
+      /bin/sh -c "
+        echo '>>> Pulling gemma4:e2b (Pupil + Teacher Agent)...' &&
+        ollama pull gemma4:e2b &&
+        echo '>>> Pulling nomic-embed-text (Embeddings)...' &&
+        ollama pull nomic-embed-text &&
+        echo '>>> All models ready.'
+      "
+    restart: "no"
+
+  # ── FastAPI backend ────────────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.backend
+    container_name: gemma_edu_backend
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+asyncpg://gemma_user:gemma_password@postgres:5432/gemma_education
+      OLLAMA_BASE_URL: http://ollama:11434
+      OLLAMA_MODEL_PUPIL: gemma4:e2b
+      OLLAMA_MODEL_TEACHER: gemma4:e2b
+      OLLAMA_EMBED_MODEL: nomic-embed-text
+      DEBUG: "true"
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app
+      - lesson_uploads:/app/uploads
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ── Next.js frontend ───────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.frontend
+    container_name: gemma_edu_frontend
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8000
+      NEXT_PUBLIC_WS_URL: ws://localhost:8000
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+      - /app/.next
+
+volumes:
+  postgres_data:
+  ollama_data:
+  lesson_uploads:
+

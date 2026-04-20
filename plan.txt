@@ -1,0 +1,402 @@
+GEMMA EDUCATION PLATFORM — BUILD PLAN
+======================================
+
+COMPETITION
+-----------
+Kaggle: Gemma 4 Good Hackathon (Google DeepMind)
+https://www.kaggle.com/competitions/gemma-4-good-hackathon
+
+Prize targets (a project can win one Impact + one Special Technology):
+
+  [PRIMARY]   Future of Education — Impact Track          $10,000
+              "Reimagine the learning journey by building multi-tool
+               agents that adapt to the individual and empower the
+               educator through seamless integration."
+              → This is an exact description of this app.
+
+  [PRIMARY]   Ollama — Special Technology Track           $10,000
+              "For the best project that utilizes and showcases the
+               capabilities of Gemma 4 running locally via Ollama."
+              → Our entire LLM stack runs via Ollama locally.
+
+  [STRETCH]   Main Track                           up to $50,000
+              Best overall vision, technical execution, real-world impact.
+
+Rules that affect this build:
+  - ONE submission per team — ship quality, not speed
+  - Max team size: 5
+  - Winning license: CC-BY 4.0 (add LICENSE file to repo)
+  - Winners must provide: code repo + full reproduction instructions
+    + architecture description. README.md IS judged.
+  - Must use Gemma 4 (gemma4:e4b via Ollama) ✓
+  - All dependencies must be OSI-approved open source licenses ✓
+  - "Multi-tool agents" is explicit wording in the Education track —
+    frame the pupil agent as having multiple tools (RAG retrieval,
+    memory, lesson lookup, live transcript search), not just a chatbot
+
+Judging framing to keep in mind:
+  - "Adapts to the individual" → short + long-term pupil memory, neurodivergent-first UX
+  - "Empowers the educator" → wireless iPad mic, lesson upload, analytics dashboard
+  - "Seamless integration" → mDNS auto-discovery, MDM deployment, 1-Click Hub launcher
+  - Special education focus → strongest possible Education track differentiator
+  - Air-gapped privacy → FERPA/GDPR/IEP compliance is a unique technical selling point
+
+
+OVERVIEW
+--------
+A 100% offline, privacy-first Edge AI ecosystem for special education classrooms.
+Every student gets a personalised AI tutor. Every teacher gets a smart teaching
+companion. Not a single byte of student data ever leaves the school network.
+
+Four-Node Architecture:
+
+  1. WINDOWS HUB (Server Node)
+     - IT admin installs a 1-Click launcher on a school Windows Desktop
+     - Silently starts: Ollama (local GPU/CPU) + Docker Compose stack
+     - Stack: FastAPI + LangGraph backend + PostgreSQL/pgvector
+     - Runs faster-whisper for live classroom speech-to-text
+     - Broadcasts mDNS (Bonjour/ZeroConf) for auto-discovery on local network
+
+  2. TEACHER COMPANION (Command Node)
+     - Native iOS/iPadOS app on teacher's school iPad
+     - Pre-lesson: upload lesson plans, PDFs, worksheets → synced to Hub
+     - Live lesson: iPad acts as high-fidelity wireless mic → streams audio
+       to Hub → generates live captions + AI context for all students
+
+  3. PUPIL CLIENT (Edge Nodes)
+     - Native iOS/iPadOS app deployed silently via MDM (Apple School Manager / Jamf)
+     - Auto-discovers Windows Hub via mDNS — no manual IP required
+     - Each student has their own personalised LangGraph ReAct agent:
+         Short-term memory:  sliding window of recent messages
+         Long-term memory:   atomic learning facts (pgvector embeddings)
+         RAG context:        live transcript + uploaded lesson materials
+     - Apple accessibility: on-device TTS, Guided Access (neurodivergent UX)
+
+  4. INFRASTRUCTURE (Air-Gap)
+     - All traffic stays on school Wi-Fi (WLAN) — zero internet egress
+     - Inherently FERPA / GDPR / IEP / COPPA compliant by design
+
+Stack:
+  - Backend:    FastAPI + LangGraph (Python)
+  - Database:   PostgreSQL + pgvector
+  - LLM:        Ollama (local) — gemma4:e4b
+  - Embeddings: nomic-embed-text
+  - STT:        faster-whisper (CPU, int8)
+  - Hub OS:     Windows (Docker Desktop)
+  - Clients:    Native iOS/iPadOS apps
+  - Discovery:  mDNS / Bonjour / ZeroConf
+
+Model Strategy:
+  - Primary:  gemma4:e4b  (pupil chat + teacher RAG, strong reasoning, low latency)
+  - Fallback: gemma4:e2b  (memory-constrained hardware, 8 GB RAM)
+  - Embeddings: nomic-embed-text (768-dim, fully local)
+  - STT:        faster-whisper tiny/small (CPU, int8, real-time)
+
+
+======================================================================
+COMPLETED PHASES
+======================================================================
+
+----------------------------------------------------------------------
+PHASE 1 — INFRASTRUCTURE & FOUNDATION                          [DONE]
+----------------------------------------------------------------------
+
+  ✓ docker-compose.yml — postgres (pgvector), ollama, backend, frontend
+  ✓ Dockerfile.backend, Dockerfile.frontend
+  ✓ core/config.py — Settings (BaseSettings) with all env vars
+  ✓ core/database.py — async SQLAlchemy engine, AsyncSession, get_db
+  ✓ requirements.txt — all deps including faster-whisper
+  ✓ .env.example
+  ✓ All __init__.py files
+
+----------------------------------------------------------------------
+PHASE 2 — DATA MODELS                                          [DONE]
+----------------------------------------------------------------------
+
+  ✓ models/domain.py — SQLAlchemy async ORM:
+      User, Lesson, LessonChunk, Conversation, Message, PupilMemory,
+      LessonSession, TranscriptChunk, PupilSessionSummary,
+      QuizQuestion, QuizAttempt
+      Enums: Role, MessageRole, SessionStatus
+
+  ✓ models/schemas.py — Pydantic:
+      UserCreate, UserResponse, LessonCreate, LessonResponse,
+      ChatMessage, ChatStreamResponse, StudentProgress,
+      SessionCreate, SessionResponse, TranscriptChunkResponse,
+      TranscriptBroadcast, PupilSessionSummaryResponse,
+      QuizQuestionResponse, QuizAnswerSubmit, QuizAttemptResponse,
+      SessionAnalytics
+
+----------------------------------------------------------------------
+PHASE 3 — SERVICES                                             [DONE]
+----------------------------------------------------------------------
+
+  ✓ services/ollama_client.py
+      generate_stream(), generate_full(), embed(), health_check()
+      get_client() / close_client()
+
+  ✓ services/vector_store.py
+      ingest_lesson() — parse PDF/DOCX/PPTX/TXT → chunk → embed → store
+      search() — pgvector cosine similarity
+
+  ✓ services/transcription.py                              [NEW FILE]
+      get_model() — lazy-load faster-whisper (CPU, int8)
+      transcribe_chunk(audio_bytes) → TranscriptionResult(text, language)
+      beam_size=1, VAD filter enabled
+
+  ✓ services/summary.py                                    [NEW FILE]
+      generate_session_artifacts(session_id) — background task entry
+      _generate_quiz_questions() — 3-5 JSON quiz Q&A via gemma3:12b
+      _generate_pupil_summary() — per-pupil summary with
+        understanding_score, key_topics, topics_discussed
+      Uses own AsyncSessionLocal() since it runs as background task
+
+----------------------------------------------------------------------
+PHASE 4 — PUPIL AGENT (LangGraph)                              [DONE]
+----------------------------------------------------------------------
+
+  ✓ agents/pupil_graph.py — ReAct StateGraph, fully async
+      PupilState: messages[]
+      build_tools() — closures capturing db/http/pupil_id/session_id
+      System prompt personalised with long-term memories
+      Token streaming via astream_events
+
+  ✓ agents/tools.py — async tool functions:
+      1. retrieve_context_func — pgvector search over lesson chunks
+      2. get_conversation_history_func — last N messages (sliding window)
+      3. list_lessons_func — available lesson titles
+      4. get_pupil_memories_func — similarity search over long-term memories
+      5. load_all_pupil_memories_func — load all memories for system prompt
+      6. save_pupil_memories_func — embed & persist new memory facts
+      7. search_live_transcript_func — similarity search over transcript
+      8. get_full_transcript_func — full ordered transcript
+
+  ✓ Pupil memory architecture:
+      SHORT-TERM: Sliding window of last N messages from conversations
+        table, loaded each turn (configurable via memory_window setting)
+      LONG-TERM: pupil_memories table — atomic facts embedded with
+        nomic-embed-text. After every response, gemma3:12b extracts
+        1-3 facts (struggles, preferences, progress) → embeds → stores.
+        On next turn, relevant memories loaded by similarity search
+        + 20 most recent injected into system prompt.
+
+----------------------------------------------------------------------
+PHASE 5 — TEACHER RAG PIPELINE                                 [DONE]
+----------------------------------------------------------------------
+
+  ✓ agents/teacher_rag.py — sequential pipeline (no graph):
+      process_lesson() — ingest PDF bytes via vector_store
+      summarise_lesson() — concatenate chunks → gemma3:12b → summary
+
+  NOTE: Teacher has NO memory (short-term or long-term). It is a
+  stateless pipeline. See Phase 7 for planned improvements.
+
+----------------------------------------------------------------------
+PHASE 6 — API ENDPOINTS + WIRING                               [DONE]
+----------------------------------------------------------------------
+
+  ✓ api/endpoints_session.py — live lesson sessions:
+      POST /session/start
+      WS   /ws/session/{id}/audio — teacher streams audio →
+           transcribe (faster-whisper) → chunk (sentence-boundary) →
+           embed (nomic-embed-text) → store (pgvector TranscriptChunk) →
+           broadcast chunk to all subscribed pupil agents
+      WS   /ws/session/{id}/subscribe — pupils receive live transcript
+      POST /session/{id}/end — triggers background artifact generation
+      GET  /session/{id}/transcript
+      GET  /session/{id}
+
+  ✓ api/endpoints_teacher.py — teacher management:
+      POST /teacher/lessons — multipart upload → process → embed
+      GET  /teacher/lessons
+      GET  /teacher/lessons/{id} — with auto-generated summary
+      GET  /teacher/sessions
+      GET  /teacher/sessions/{id}/analytics — aggregated metrics
+      GET  /teacher/students
+      GET  /teacher/students/{id}/progress — summaries + quiz + messages
+
+  ✓ api/endpoints_pupil.py — pupil interactions:
+      WS   /ws/pupil/{id}/chat — JSON {message, conversation_id,
+           session_id} → streams tokens
+      GET  /pupil/{id}/sessions
+      GET  /pupil/{id}/sessions/{sid}/summary
+      GET  /pupil/{id}/sessions/{sid}/quiz
+      POST /pupil/{id}/quiz/{qid}/answer
+      GET  /pupil/{id}/lessons
+
+  ✓ main.py — FastAPI app:
+      Lifespan: create tables + verify Ollama + cleanup
+      CORS middleware (permissive for dev)
+      Mounts: session, teacher, pupil routers
+      GET /health
+      POST/GET /users (minimal CRUD for dev)
+
+
+======================================================================
+REMAINING PHASES
+======================================================================
+
+----------------------------------------------------------------------
+PHASE 7 — TEACHER AGENT MEMORY                                 [DONE]
+----------------------------------------------------------------------
+
+  NOTE: Architecture pivot — web frontend (Next.js) is being replaced by
+  native iOS apps. The FastAPI backend is unchanged and serves as the
+  Windows Hub API. Phases 8-10 below reflect the new client strategy.
+
+----------------------------------------------------------------------
+
+The teacher side currently has NO memory — it's a stateless pipeline.
+This phase adds short-term and long-term memory to match the pupil agent.
+
+7a. Teacher conversation model
+  - Add TeacherConversation table (or reuse Conversation with role)
+  - Teacher can chat with an AI assistant about lesson planning,
+    pupil performance, and teaching strategies
+  - Short-term: sliding window of recent messages per conversation
+
+7b. Teacher long-term memory (new table: teacher_memories)
+  - TeacherMemory model: id, teacher_id, memory, embedding Vector(768)
+  - Stores cross-session facts about the teacher's preferences, class
+    dynamics, which explanations worked, recurring pupil issues
+  - After each teacher conversation turn, extract 1-3 facts via
+    gemma3:12b (same pattern as pupil memory extraction)
+  - Similarity retrieval on each turn to personalise responses
+
+7c. Teacher agent graph (new: agents/teacher_graph.py)
+  - LangGraph ReAct StateGraph (mirroring pupil_graph.py pattern)
+  - Tools:
+      search_lesson_content — RAG over uploaded materials
+      get_class_analytics — pull aggregated pupil performance
+      get_student_profile — individual pupil summaries + quiz results
+      get_teacher_memories — similarity search over long-term memories
+      search_transcript — search past session transcripts
+  - System prompt personalised with teacher memories
+  - Token streaming via astream_events
+
+7d. Teacher chat endpoint
+  - WS /ws/teacher/{teacher_id}/chat
+  - Mirror the pupil chat WebSocket pattern
+  - Persists messages + runs memory extraction after each turn
+
+7e. Cross-agent memory bridge (stretch)
+  - Teacher insights about individual pupils feed into pupil agent
+    context (e.g. "teacher noted this pupil needs more visual aids")
+  - Pupil learning patterns surface in teacher analytics
+
+----------------------------------------------------------------------
+PHASE 7b — SEMANTIC ANSWER CACHE                               [DONE]
+----------------------------------------------------------------------
+
+In a classroom of 30 pupils, many students ask semantically identical
+questions about the same lesson. Running Gemma 4 per-student wastes
+cycles on constrained school hardware. A per-lesson semantic cache
+solves this.
+
+Schema (new table: semantic_cache)
+  id            UUID PK
+  lesson_id     FK → lessons.id
+  question      TEXT
+  question_emb  Vector(768)        -- nomic-embed-text embedding
+  answer        TEXT
+  hit_count     INT DEFAULT 0      -- for analytics / popularity
+  created_at    TIMESTAMP
+
+Lookup flow (services/semantic_cache.py)
+  lookup(question: str, lesson_id: UUID, threshold: float = 0.92)
+    → embed question via nomic-embed-text
+    → cosine similarity search against semantic_cache WHERE lesson_id = ?
+    → if best_score >= threshold: increment hit_count, return answer
+    → else: return None
+
+  store(question: str, answer: str, lesson_id: UUID)
+    → embed question
+    → insert row into semantic_cache
+
+Wiring into pupil_graph.py
+  - Before invoking the LangGraph agent: call lookup()
+  - On cache hit: stream cached answer directly (no Ollama call)
+  - On cache miss: run agent normally, then call store() with result
+
+Cache lifecycle
+  - Scoped per lesson_id — answers stay relevant to current material
+  - Cache cleared / archived when lesson session ends
+  - Threshold configurable via Settings (semantic_cache_threshold: float)
+
+Analytics benefit
+  - hit_count exposes which questions the class is asking most
+  - Teacher dashboard can surface "top questions this lesson"
+
+----------------------------------------------------------------------
+PHASE 8 — iOS CLIENT APPS                                      [TODO]
+----------------------------------------------------------------------
+
+8a. Teacher Companion (iOS/iPadOS)
+  - Native SwiftUI app
+  - mDNS (NetServiceBrowser) to auto-discover Windows Hub on local network
+  - Lesson upload: file picker → multipart POST /teacher/lessons
+  - Live mic streaming: AVAudioEngine → PCM chunks → WS /ws/session/{id}/audio
+  - Live captions view: subscribes to transcript broadcast WebSocket
+  - Class dashboard: pupil list, session history, analytics
+
+8b. Pupil Client (iOS/iPadOS)
+  - Native SwiftUI app
+  - mDNS auto-discovery of Windows Hub (same Bonjour lookup)
+  - Student login (pupil_id selection — no cloud auth)
+  - Chat UI: WS /ws/pupil/{id}/chat with streaming token display
+  - Apple accessibility: AVSpeechSynthesizer (TTS), Guided Access support
+  - Lesson list: GET /pupil/{id}/lessons
+  - Quiz view: GET /pupil/{id}/sessions/{sid}/quiz
+
+8c. MDM deployment
+  - Package both apps as .ipa for silent distribution via
+    Apple School Manager or Jamf
+  - Hub URL pre-configured in MDM profile (or discovered via mDNS)
+
+----------------------------------------------------------------------
+PHASE 9 — WINDOWS HUB LAUNCHER                                [TODO]
+----------------------------------------------------------------------
+
+  - Single .exe installer (e.g. Inno Setup or NSIS)
+  - Bundled: Docker Desktop check / install prompt, Ollama install
+  - On launch: docker-compose up + ollama pull gemma4:e4b
+  - System tray icon with status (running / stopped / error)
+  - Displays local IP + mDNS hostname for IT reference
+  - One-click stop/start
+
+
+======================================================================
+COMPETITION SUBMISSION CHECKLIST
+======================================================================
+  [ ] LICENSE file in repo root (CC-BY 4.0)
+  [ ] README.md includes:
+        - Four-node architecture diagram
+        - Special education problem statement (judge framing)
+        - Privacy/compliance table (FERPA/GDPR/IEP/COPPA)
+        - Quick start: Hub setup + PoC run instructions
+        - How gemma4:e4b is used and why (Ollama track)
+        - Screenshot or demo GIF of pupil chat + teacher companion
+  [ ] Kaggle notebook or writeup submitted alongside code
+  [ ] All dependencies are OSI-approved open source
+  [ ] Submission describes the app as a "multi-tool agent" system
+      (aligns with Future of Education track wording)
+  [ ] Highlight air-gap / privacy angle in submission writeup
+  [ ] Highlight neurodivergent / special education focus
+  [ ] Highlight mDNS auto-discovery as "seamless integration"
+
+
+======================================================================
+DECISIONS & SCOPE
+======================================================================
+  - No authentication in v1 (IDs passed in URL/body; add JWT later)
+  - pgvector on same Postgres instance (no separate Chroma container)
+  - No internet required — fully air-gapped by design
+  - gemma4:e4b for all LLM tasks (both agents); e2b as fallback
+  - nomic-embed-text for all embeddings (768-dim)
+  - faster-whisper tiny/small for local STT (CPU, int8 quantisation)
+  - Frame pupil agent as multi-tool (retrieval + memory + lesson +
+    transcript tools) in README — matches competition track language
+  - License all code CC-BY 4.0 to comply with winner obligations
+  - Teacher memory (Phase 7) complete — TeacherConversation/TeacherMessage/TeacherMemory + teacher_graph.py
+  - Web frontend (Next.js) replaced by native iOS apps (Phase 8)
+  - Windows Hub is the only server node — single Docker Compose stack

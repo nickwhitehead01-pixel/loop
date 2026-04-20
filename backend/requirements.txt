@@ -1,0 +1,31 @@
+# Web framework
+fastapi==0.115.12
+uvicorn[standard]==0.34.0
+python-multipart==0.0.20
+websockets==15.0.1
+
+# Database
+sqlalchemy[asyncio]==2.0.40
+asyncpg==0.30.0
+pgvector==0.4.0
+alembic==1.15.2
+
+# Configuration
+pydantic-settings==2.9.1
+python-dotenv==1.1.0
+
+# LLM / Agents
+langgraph==0.4.1
+langchain-core==0.3.52
+langchain-ollama==0.3.2
+langchain-community==0.3.21
+httpx==0.28.1
+
+# Document processing
+pypdf==5.4.0
+python-docx==1.1.2
+python-pptx==1.0.2
+
+# Speech-to-text
+faster-whisper==1.1.1
+
