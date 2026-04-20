@@ -184,12 +184,40 @@ docker-compose up
 
 ---
 
+## Development Setup
+
+**For local development, run Ollama on your host machine (not in Docker):**
+
+```bash
+# In one terminal, start Ollama on your host
+ollama serve
+
+# In another terminal, pull models if needed
+ollama pull gemma4:e2b
+ollama pull nomic-embed-text
+
+# Then start only the database and backend (comment out the ollama service in docker-compose.yml)
+docker-compose up postgres backend
+```
+
+This avoids:
+- Running LLM inference inside a container (performance overhead)
+- Duplicate model downloads
+- Resource contention on 16GB machines
+
+The backend will connect to your host Ollama via `OLLAMA_BASE_URL=http://localhost:11434` (set in `.env`).
+
+---
+
 ## PoC: Whisper + Gemma 4 (Try it now)
 
 Before deploying the full stack, try the self-contained proof-of-concept:
 
 ```bash
-# Create venv and install deps
+# Ensure Ollama is running on your host
+ollama serve  # in another terminal
+
+# In your project terminal
 python3 -m venv venv && source venv/bin/activate
 pip install -r backend/requirements.txt
 
@@ -197,6 +225,8 @@ python poc/poc_whisper_gemma.py
 ```
 
 Open http://localhost:8765 — record your voice, get a live transcript, ask Gemma 4 a question about it. This is the core loop of the entire platform.
+
+The PoC uses your local Ollama instance directly (no Docker involved).
 
 ---
 
