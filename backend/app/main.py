@@ -12,10 +12,32 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.config import settings
-from app.core.database import Base, engine
+from app.core.database import Base, engine, AsyncSessionLocal
 from app.services import ollama_client
 
 logger = logging.getLogger(__name__)
+
+
+async def _seed_default_users() -> None:
+    """Ensure a default teacher (id=1) and a default pupil (id=2) exist."""
+    from sqlalchemy import select, text
+    from app.models.domain import User, Role
+
+    async with AsyncSessionLocal() as db:
+        # Check for teacher id=1
+        result = await db.execute(select(User).where(User.id == 1))
+        if result.scalar_one_or_none() is None:
+            # Force id=1 via raw INSERT so the FK from lessons always resolves
+            await db.execute(
+                text("INSERT INTO users (id, name, role) VALUES (1, 'Default Teacher', 'teacher') ON CONFLICT DO NOTHING")
+            )
+        result = await db.execute(select(User).where(User.id == 2))
+        if result.scalar_one_or_none() is None:
+            await db.execute(
+                text("INSERT INTO users (id, name, role) VALUES (2, 'Default Pupil', 'pupil') ON CONFLICT DO NOTHING")
+            )
+        await db.commit()
+    logger.info("Default users seeded (teacher id=1, pupil id=2)")
 
 
 @asynccontextmanager
@@ -25,6 +47,9 @@ async def lifespan(app: FastAPI):
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     logger.info("Database tables created / verified")
+
+    # Seed default users (auth is deferred — v1 uses fixed IDs)
+    await _seed_default_users()
 
     # Verify Ollama is reachable
     healthy = await ollama_client.health_check()

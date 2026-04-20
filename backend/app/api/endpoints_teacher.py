@@ -18,6 +18,8 @@ import logging
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse
+import mimetypes
 from sqlalchemy import select, func as sa_func
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -29,6 +31,7 @@ from app.services import transcription
 from app.models.domain import (
     Conversation,
     Lesson,
+    LessonFile,
     LessonSession,
     Message,
     PupilSessionSummary,
@@ -54,41 +57,69 @@ router = APIRouter(prefix="/teacher", tags=["teacher"])
 # Lessons
 # ---------------------------------------------------------------------------
 
+MAX_FILE_BYTES = 25 * 1024 * 1024  # 25 MB per file
+
+
 @router.post("/lessons", response_model=LessonResponse)
 async def upload_lesson(
-    file: UploadFile = File(...),
+    files: list[UploadFile] = File(...),
     title: str = Form(...),
     teacher_id: int = Form(...),
     session_id: int | None = Form(None),
     db: AsyncSession = Depends(get_db),
 ):
-    """Upload a lesson file (PDF, DOCX, PPTX, TXT). Chunks, embeds, and stores."""
-    if not file.filename:
-        raise HTTPException(status_code=400, detail="No file provided")
+    """Upload one or more lesson files (PDF, DOCX, PPTX, TXT) grouped under a single lesson."""
+    if not files:
+        raise HTTPException(status_code=400, detail="At least one file is required")
 
-    # Save the uploaded file
     upload_dir = Path(settings.upload_dir)
     upload_dir.mkdir(parents=True, exist_ok=True)
-    file_path = upload_dir / file.filename
-    content = await file.read()
-    file_path.write_bytes(content)
 
-    # Create lesson record
+    # Read all file contents first (validates size before touching the DB)
+    file_entries: list[tuple[str, bytes]] = []
+    for upload in files:
+        if not upload.filename:
+            raise HTTPException(status_code=400, detail="Each file must have a filename")
+        content = await upload.read()
+        if len(content) > MAX_FILE_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"{upload.filename} exceeds the 25 MB limit ({len(content) // (1024*1024)} MB)",
+            )
+        file_entries.append((upload.filename, content))
+
+    # Create the lesson record — use the first filename as the primary file_path
+    first_filename, first_content = file_entries[0]
+    first_path = upload_dir / first_filename
+    first_path.write_bytes(first_content)
+
     lesson = Lesson(
         title=title,
         teacher_id=teacher_id,
         session_id=session_id,
-        file_path=str(file_path),
+        file_path=str(first_path),
     )
     db.add(lesson)
     await db.flush()
     await db.refresh(lesson)
 
-    # Ingest: parse, chunk, embed, store
-    await process_lesson(lesson.id, content, db, filename=file.filename)
+    # Persist each file and ingest its chunks
+    for filename, content in file_entries:
+        dest = upload_dir / filename
+        if not dest.exists():
+            dest.write_bytes(content)
+        db.add(LessonFile(
+            lesson_id=lesson.id,
+            original_filename=filename,
+            file_path=str(dest),
+        ))
+        await process_lesson(lesson.id, content, db, filename=filename)
 
     await db.commit()
     await db.refresh(lesson)
+
+    # Attach computed file_count for the response
+    lesson.file_count = len(file_entries)  # type: ignore[attr-defined]
     return lesson
 
 
@@ -97,11 +128,26 @@ async def list_lessons(
     teacher_id: int | None = None,
     db: AsyncSession = Depends(get_db),
 ):
+    from app.models.domain import LessonFile as LF
     query = select(Lesson).order_by(Lesson.created_at.desc())
     if teacher_id is not None:
         query = query.where(Lesson.teacher_id == teacher_id)
     result = await db.execute(query)
-    return result.scalars().all()
+    lessons = result.scalars().all()
+
+    # Attach file counts
+    if lessons:
+        ids = [l.id for l in lessons]
+        counts_result = await db.execute(
+            select(LF.lesson_id, sa_func.count(LF.id).label("cnt"))
+            .where(LF.lesson_id.in_(ids))
+            .group_by(LF.lesson_id)
+        )
+        count_map = {row.lesson_id: row.cnt for row in counts_result}
+        for lesson in lessons:
+            lesson.file_count = count_map.get(lesson.id, 1)  # type: ignore[attr-defined]
+
+    return lessons
 
 
 @router.get("/lessons/{lesson_id}")
@@ -114,7 +160,26 @@ async def get_lesson_detail(
     if not lesson:
         raise HTTPException(status_code=404, detail="Lesson not found")
 
-    summary = await summarise_lesson(lesson_id, db)
+    try:
+        summary = await summarise_lesson(lesson_id, db)
+    except Exception:
+        logger.exception("summarise_lesson failed for lesson %d", lesson_id)
+        summary = None
+
+    # Load associated files
+    files_result = await db.execute(
+        select(LessonFile).where(LessonFile.lesson_id == lesson_id).order_by(LessonFile.id)
+    )
+    files = files_result.scalars().all()
+
+    # Load indexed chunks (content only — skip the embedding vector)
+    from app.models.domain import LessonChunk
+    chunks_result = await db.execute(
+        select(LessonChunk.id, LessonChunk.content)
+        .where(LessonChunk.lesson_id == lesson_id)
+        .order_by(LessonChunk.id)
+    )
+    chunks = [{"id": row.id, "content": row.content} for row in chunks_result]
 
     return {
         "id": lesson.id,
@@ -124,7 +189,116 @@ async def get_lesson_detail(
         "file_path": lesson.file_path,
         "created_at": lesson.created_at,
         "summary": summary,
+        "files": [
+            {
+                "id": f.id,
+                "original_filename": f.original_filename,
+                "created_at": f.created_at.isoformat(),
+                "url": f"/teacher/files/{f.id}",
+            }
+            for f in files
+        ],
+        "chunks": chunks,
+        "chunk_count": len(chunks),
     }
+
+
+@router.delete("/lessons/{lesson_id}", status_code=204)
+async def delete_lesson(
+    lesson_id: int,
+    db: AsyncSession = Depends(get_db),
+):
+    """Delete a lesson and all its chunks/files (cascaded by FK)."""
+    result = await db.execute(select(Lesson).where(Lesson.id == lesson_id))
+    lesson = result.scalar_one_or_none()
+    if not lesson:
+        raise HTTPException(status_code=404, detail="Lesson not found")
+
+
+@router.post("/lessons/{lesson_id}/files")
+async def add_files_to_lesson(
+    lesson_id: int,
+    files: list[UploadFile] = File(...),
+    db: AsyncSession = Depends(get_db),
+):
+    """Append one or more files to an existing lesson and index their content."""
+    result = await db.execute(select(Lesson).where(Lesson.id == lesson_id))
+    lesson = result.scalar_one_or_none()
+    if not lesson:
+        raise HTTPException(status_code=404, detail="Lesson not found")
+
+    if not files:
+        raise HTTPException(status_code=400, detail="At least one file is required")
+
+    upload_dir = Path(settings.upload_dir)
+    upload_dir.mkdir(parents=True, exist_ok=True)
+
+    file_entries: list[tuple[str, bytes]] = []
+    for upload in files:
+        if not upload.filename:
+            raise HTTPException(status_code=400, detail="Each file must have a filename")
+        content = await upload.read()
+        if len(content) > MAX_FILE_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"{upload.filename} exceeds the 25 MB limit ({len(content) // (1024*1024)} MB)",
+            )
+        file_entries.append((upload.filename, content))
+
+    added = []
+    for filename, content in file_entries:
+        dest = upload_dir / filename
+        if not dest.exists():
+            dest.write_bytes(content)
+        lf = LessonFile(
+            lesson_id=lesson_id,
+            original_filename=filename,
+            file_path=str(dest),
+        )
+        db.add(lf)
+        await db.flush()
+        await db.refresh(lf)
+        await process_lesson(lesson_id, content, db, filename=filename)
+        added.append({
+            "id": lf.id,
+            "original_filename": lf.original_filename,
+            "created_at": lf.created_at.isoformat(),
+            "url": f"/teacher/files/{lf.id}",
+        })
+
+    await db.commit()
+    return {"added": added, "count": len(added)}
+    await db.delete(lesson)
+    await db.commit()
+
+
+@router.get("/files/{file_id}")
+async def serve_lesson_file(
+    file_id: int,
+    db: AsyncSession = Depends(get_db),
+):
+    """Stream a lesson file back to the browser with an inline Content-Disposition."""
+    result = await db.execute(select(LessonFile).where(LessonFile.id == file_id))
+    lesson_file = result.scalar_one_or_none()
+    if not lesson_file:
+        raise HTTPException(status_code=404, detail="File not found")
+
+    path = Path(lesson_file.file_path)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="File no longer exists on disk")
+
+    mime, _ = mimetypes.guess_type(lesson_file.original_filename)
+    mime = mime or "application/octet-stream"
+
+    # PDF and plain-text files render inline; everything else prompts a download
+    inline_types = {"application/pdf", "text/plain"}
+    disposition = "inline" if mime in inline_types else "attachment"
+
+    return FileResponse(
+        path=str(path),
+        media_type=mime,
+        headers={"Content-Disposition": f'{disposition}; filename="{lesson_file.original_filename}"'},
+    )
 
 
 # ---------------------------------------------------------------------------

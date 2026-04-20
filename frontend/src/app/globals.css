@@ -1,0 +1,244 @@
+/* ==========================================================================
+   LOOPLENSE — Teacher UI global styles
+   Design tokens from the Looplense design system (Teaching Concept.fig).
+   ========================================================================== */
+
+/* ---- Lexend webfont (local, served from /public/fonts/) --------------- */
+@font-face { font-family: 'Lexend'; font-weight: 100; font-style: normal; font-display: swap; src: url('/fonts/Lexend-Thin.ttf') format('truetype'); }
+@font-face { font-family: 'Lexend'; font-weight: 200; font-style: normal; font-display: swap; src: url('/fonts/Lexend-ExtraLight.ttf') format('truetype'); }
+@font-face { font-family: 'Lexend'; font-weight: 300; font-style: normal; font-display: swap; src: url('/fonts/Lexend-Light.ttf') format('truetype'); }
+@font-face { font-family: 'Lexend'; font-weight: 400; font-style: normal; font-display: swap; src: url('/fonts/Lexend-Regular.ttf') format('truetype'); }
+@font-face { font-family: 'Lexend'; font-weight: 500; font-style: normal; font-display: swap; src: url('/fonts/Lexend-Medium.ttf') format('truetype'); }
+@font-face { font-family: 'Lexend'; font-weight: 600; font-style: normal; font-display: swap; src: url('/fonts/Lexend-SemiBold.ttf') format('truetype'); }
+@font-face { font-family: 'Lexend'; font-weight: 700; font-style: normal; font-display: swap; src: url('/fonts/Lexend-Bold.ttf') format('truetype'); }
+@font-face { font-family: 'Lexend'; font-weight: 800; font-style: normal; font-display: swap; src: url('/fonts/Lexend-ExtraBold.ttf') format('truetype'); }
+@font-face { font-family: 'Lexend'; font-weight: 900; font-style: normal; font-display: swap; src: url('/fonts/Lexend-Black.ttf') format('truetype'); }
+
+/* ---- Design tokens ------------------------------------------------------- */
+:root {
+  /* Surfaces */
+  --paper:        #F7F3E9;
+  --paper-shade:  #E5E1D7;
+  --paper-input:  #FAF3E2;
+  --paper-card:   #F0EBD8;
+
+  /* Inks */
+  --ink:          #2B2B2B;
+  --ink-black:    #000000;
+  --ink-soft:     rgba(0, 0, 0, 0.12);
+  --ink-muted:    rgba(43, 43, 43, 0.56);
+
+  /* Action (primary blue) */
+  --action:        #3A66DB;
+  --action-hover:  #4570E0;
+  --action-press:  #3359C2;
+  --action-bright: #2F6FED;
+  --snow:          #F7F3E9;  /* label on primary chip */
+  --focus-ring:    rgba(58, 102, 219, 0.35);
+
+  /* Semantic */
+  --success:       #2D7A3F;
+  --success-soft:  #E7EEDE;
+  --warn:          #9A6A1E;
+  --warn-soft:     #F3E7CF;
+  --error:         #A03636;
+  --error-soft:    #F2D9D6;
+
+  /* Typography */
+  --font-sans:     'Lexend', ui-sans-serif, system-ui, sans-serif;
+  --weight-regular: 400;
+  --weight-medium:  500;
+  --weight-bold:    700;
+
+  /* Spacing */
+  --space-1:  4px;
+  --space-2:  8px;
+  --space-3: 10px;
+  --space-4: 16px;
+  --space-5: 28px;
+  --space-6: 36px;
+
+  /* Radii */
+  --radius-sm: 11px;
+  --radius-md: 12px;
+  --radius-lg: 16px;
+
+  /* Elevation */
+  --shadow-chip:       0 4px 4px 0 rgba(0, 0, 0, 0.25);
+  --shadow-chip-press: 0 1px 2px 0 rgba(0, 0, 0, 0.20);
+  --shadow-card:       0 1px 3px 0 rgba(0, 0, 0, 0.10);
+
+  /* Motion */
+  --ease:       cubic-bezier(0.2, 0, 0, 1);
+  --dur-quick:  120ms;
+  --dur-enter:  180ms;
+}
+
+/* ---- Reset & base -------------------------------------------------------- */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body {
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--font-sans);
+  font-weight: var(--weight-regular);
+  font-size: 16px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* ---- Semantic type ------------------------------------------------------- */
+.ll-display {
+  font: var(--weight-regular) 48px/72px var(--font-sans);
+  color: var(--ink);
+}
+.ll-heading {
+  font: var(--weight-bold) 24px/32px var(--font-sans);
+  color: var(--ink);
+}
+.ll-subheading {
+  font: var(--weight-medium) 18px/24px var(--font-sans);
+  color: var(--ink);
+}
+.ll-body {
+  font: var(--weight-regular) 16px/24px var(--font-sans);
+  color: var(--ink);
+}
+.ll-label {
+  font: var(--weight-bold) 11px/11px var(--font-sans);
+  color: var(--ink-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+/* ---- Chip / button ------------------------------------------------------- */
+.ll-chip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-3);
+  padding: 10px var(--space-4);
+  border: none;
+  border-radius: var(--radius-md);
+  background: var(--action);
+  color: var(--snow);
+  font: var(--weight-medium) 16px/16px var(--font-sans);
+  box-shadow: var(--shadow-chip);
+  cursor: pointer;
+  white-space: nowrap;
+  transition:
+    background-color var(--dur-quick) var(--ease),
+    box-shadow var(--dur-quick) var(--ease),
+    transform var(--dur-quick) var(--ease);
+}
+.ll-chip:hover  { background: var(--action-hover); }
+.ll-chip:active { background: var(--action-press); box-shadow: var(--shadow-chip-press); transform: translateY(1px); }
+.ll-chip:focus-visible { outline: 3px solid var(--focus-ring); outline-offset: 2px; }
+.ll-chip[disabled] { opacity: 0.4; cursor: not-allowed; box-shadow: none; }
+.ll-chip--ghost {
+  background: transparent; color: var(--ink);
+  box-shadow: none; border: 1px solid var(--ink-soft);
+}
+.ll-chip--ghost:hover { background: rgba(0,0,0,0.04); }
+
+/* ---- Input --------------------------------------------------------------- */
+.ll-input {
+  display: block;
+  width: 100%;
+  padding: 12px 16px;
+  background: var(--paper-input);
+  color: var(--ink);
+  border: 1px solid var(--ink-black);
+  border-radius: var(--radius-sm);
+  font: var(--weight-regular) 16px/24px var(--font-sans);
+  transition: border-color var(--dur-quick) var(--ease);
+  resize: none;
+}
+.ll-input:focus { outline: none; border: 2px solid var(--action); }
+.ll-input::placeholder { color: var(--ink-muted); }
+
+/* ---- Card ---------------------------------------------------------------- */
+.ll-card {
+  background: var(--paper);
+  border: 1px solid var(--ink-soft);
+  border-radius: var(--radius-lg);
+  padding: var(--space-5);
+  box-shadow: var(--shadow-card);
+}
+
+/* ---- Pill / badge -------------------------------------------------------- */
+.ll-pill {
+  display: inline-flex; align-items: center; gap: 6px;
+  height: 26px; padding: 0 12px;
+  border-radius: 999px;
+  font: 600 12px/26px var(--font-sans);
+  background: var(--paper-shade);
+  color: var(--ink-muted);
+  white-space: nowrap;
+}
+.ll-pill--success { background: var(--success-soft); color: var(--success); }
+.ll-pill--warn    { background: var(--warn-soft);    color: var(--warn);    }
+.ll-pill--error   { background: var(--error-soft);   color: var(--error);   }
+.ll-pill--info    { background: #DCE4F7;              color: var(--action);  }
+
+/* ---- Chat turn ----------------------------------------------------------- */
+.ll-turn { animation: ll-enter var(--dur-enter) var(--ease) both; }
+@keyframes ll-enter {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: translateY(0);   }
+}
+
+/* ---- Scrollbar (subtle) -------------------------------------------------- */
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--ink-soft); border-radius: 3px; }
+
+/* ---- Dialog / modal ------------------------------------------------------ */
+.ll-backdrop {
+  position: fixed; inset: 0;
+  background: rgba(43, 43, 43, 0.45);
+  backdrop-filter: blur(2px);
+  -webkit-backdrop-filter: blur(2px);
+  display: flex; align-items: center; justify-content: center;
+  z-index: 100;
+  animation: ll-fade-in var(--dur-enter) var(--ease) both;
+}
+@keyframes ll-fade-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+.ll-dialog {
+  background: var(--paper);
+  border: 1px solid var(--ink-soft);
+  border-radius: var(--radius-lg);
+  box-shadow: 0 8px 32px 0 rgba(0,0,0,0.18);
+  padding: 32px 28px 24px;
+  width: min(440px, calc(100vw - 48px));
+  animation: ll-dialog-in var(--dur-enter) var(--ease) both;
+}
+@keyframes ll-dialog-in {
+  from { opacity: 0; transform: translateY(8px) scale(0.98); }
+  to   { opacity: 1; transform: translateY(0)  scale(1);    }
+}
+.ll-dialog__title {
+  font: var(--weight-bold) 18px/24px var(--font-sans);
+  color: var(--ink);
+  margin-bottom: 10px;
+}
+.ll-dialog__body {
+  font: var(--weight-regular) 15px/22px var(--font-sans);
+  color: var(--ink-muted);
+  margin-bottom: 24px;
+}
+.ll-dialog__actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+}
+/* Destructive chip variant */
+.ll-chip--danger {
+  background: var(--error);
+}
+.ll-chip--danger:hover  { background: #b33e3e; }
+.ll-chip--danger:active { background: #922e2e; }

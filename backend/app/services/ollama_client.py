@@ -51,11 +51,12 @@ async def health_check() -> bool:
 async def embed(text: str) -> list[float]:
     """Embed *text* using nomic-embed-text and return a 768-dim float vector."""
     r = await get_client().post(
-        "/api/embeddings",
-        json={"model": settings.ollama_embed_model, "prompt": text},
+        "/api/embed",
+        json={"model": settings.ollama_embed_model, "input": text},
     )
     r.raise_for_status()
-    return r.json()["embedding"]
+    # /api/embed returns {"embeddings": [[...]]}
+    return r.json()["embeddings"][0]
 
 
 # ---------------------------------------------------------------------------

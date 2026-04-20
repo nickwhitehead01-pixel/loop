@@ -67,11 +67,9 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      ollama:
-        condition: service_healthy
     environment:
       DATABASE_URL: postgresql+asyncpg://gemma_user:gemma_password@postgres:5432/gemma_education
-      OLLAMA_BASE_URL: http://ollama:11434
+      OLLAMA_BASE_URL: http://host.docker.internal:11434
       OLLAMA_MODEL_PUPIL: gemma4:e2b
       OLLAMA_MODEL_TEACHER: gemma4:e2b
       OLLAMA_EMBED_MODEL: nomic-embed-text

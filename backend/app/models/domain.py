@@ -144,9 +144,29 @@ class Lesson(Base):
 
     teacher: Mapped[User] = relationship(back_populates="lessons")
     session: Mapped[LessonSession | None] = relationship(back_populates="lessons")
+    files: Mapped[list[LessonFile]] = relationship(
+        back_populates="lesson", cascade="all, delete-orphan"
+    )
     chunks: Mapped[list[LessonChunk]] = relationship(
         back_populates="lesson", cascade="all, delete-orphan"
     )
+
+
+class LessonFile(Base):
+    """One physical uploaded file belonging to a lesson."""
+    __tablename__ = "lesson_files"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    lesson_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("lessons.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    original_filename: Mapped[str] = mapped_column(String(512), nullable=False)
+    file_path: Mapped[str] = mapped_column(String(512), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    lesson: Mapped["Lesson"] = relationship(back_populates="files")
 
 
 class LessonChunk(Base):

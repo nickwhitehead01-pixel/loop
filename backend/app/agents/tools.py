@@ -30,12 +30,12 @@ from app.models.domain import Conversation, Lesson, LessonChunk, Message, PupilM
 async def _embed(text: str, http_client) -> list[float]:
     """Call Ollama embed endpoint and return a float vector."""
     response = await http_client.post(
-        f"{settings.ollama_base_url}/api/embeddings",
-        json={"model": settings.ollama_embed_model, "prompt": text},
+        f"{settings.ollama_base_url}/api/embed",
+        json={"model": settings.ollama_embed_model, "input": text},
         timeout=30,
     )
     response.raise_for_status()
-    return response.json()["embedding"]
+    return response.json()["embeddings"][0]
 
 
 async def retrieve_context_func(
