@@ -36,8 +36,8 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
 logger = logging.getLogger(__name__)
 
 OLLAMA_BASE_URL = "http://localhost:11434"
-OLLAMA_MODEL = "gemma4:e2b"
-WHISPER_MODEL_SIZE = "tiny"   # tiny ~75MB RAM; small ~500MB — use tiny to avoid OOM on 16GB with Ollama running
+OLLAMA_MODEL = "gemma3:1b"    # 815MB — fits comfortably on M1 8GB; swap back to gemma4:e2b on 16GB+
+WHISPER_MODEL_SIZE = "tiny"   # tiny ~75MB RAM; small ~500MB — use tiny to avoid OOM on 8GB with Ollama running
 
 app = FastAPI()
 

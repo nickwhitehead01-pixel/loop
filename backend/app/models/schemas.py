@@ -29,6 +29,15 @@ class LessonCreate(BaseModel):
     teacher_id: int
 
 
+class LessonFileResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    original_filename: str
+    file_path: str
+    created_at: datetime
+
+
 class LessonResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -36,6 +45,7 @@ class LessonResponse(BaseModel):
     title: str
     teacher_id: int
     file_path: str
+    file_count: int = 1
     created_at: datetime
 
 
