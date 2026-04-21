@@ -5,6 +5,7 @@ Mounts all routers, sets up CORS, and creates DB tables on startup.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
@@ -14,6 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.core.config import settings
 from app.core.database import Base, engine, AsyncSessionLocal
 from app.services import ollama_client
+from app.services.transcription import get_model
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +59,13 @@ async def lifespan(app: FastAPI):
         logger.info("Ollama is reachable at %s", settings.ollama_base_url)
     else:
         logger.warning("Ollama is NOT reachable at %s — LLM calls will fail", settings.ollama_base_url)
+
+    # Warm up Whisper once so first live transcript does not pay model load latency.
+    try:
+        await asyncio.to_thread(get_model)
+        logger.info("Whisper model warm-up complete")
+    except Exception:
+        logger.exception("Whisper warm-up failed; live transcription may have cold-start delay")
 
     yield
 

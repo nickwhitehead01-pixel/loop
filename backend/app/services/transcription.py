@@ -54,10 +54,10 @@ async def transcribe_chunk(audio_bytes: bytes) -> TranscriptionResult:
         beam_size=1,          # fastest decoding
         best_of=1,
         temperature=0.0,
-        vad_filter=True,      # skip silence
-        vad_parameters=dict(
-            min_silence_duration_ms=500,
-        ),
+        language="en",
+        condition_on_previous_text=False,
+        vad_filter=False,
+        no_speech_threshold=0.45,
     )
     text = " ".join(seg.text.strip() for seg in segments).strip()
     return TranscriptionResult(text=text, language=info.language or "en")

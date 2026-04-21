@@ -12,11 +12,12 @@ import asyncio
 import logging
 import time
 from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
-from sqlalchemy import select
+from sqlalchemy import select, func as sa_func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.models.domain import (
+    Lesson,
     LessonSession,
     SessionStatus,
     TranscriptChunk,
@@ -51,13 +52,27 @@ async def start_session(
     body: SessionCreate,
     db: AsyncSession = Depends(get_db),
 ):
+    lesson_result = await db.execute(
+        select(Lesson).where(
+            Lesson.id == body.lesson_id,
+            Lesson.teacher_id == body.teacher_id,
+        )
+    )
+    lesson = lesson_result.scalar_one_or_none()
+    if lesson is None:
+        raise HTTPException(status_code=404, detail="Lesson not found for this teacher")
+
     session = LessonSession(
         teacher_id=body.teacher_id,
-        title=body.title,
+        title=body.title or f"Session: {lesson.title}",
         status=SessionStatus.live,
     )
     db.add(session)
     await db.flush()
+
+    lesson.session_id = session.id
+
+    await db.commit()
     await db.refresh(session)
     return session
 
@@ -204,6 +219,7 @@ async def end_session(
     session.status = SessionStatus.ended
     session.ended_at = sa_func.now()
     await db.flush()
+    await db.commit()
     await db.refresh(session)
 
     # Trigger background summary + quiz generation

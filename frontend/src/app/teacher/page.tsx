@@ -1,6 +1,5 @@
 "use client";
-import { useCallback, useEffect, useState } from "react";
-import dynamic from "next/dynamic";
+import { useCallback, useEffect, useRef, useState } from "react";
 import LessonUpload from "@/components/LessonUpload";
 import LessonDetail from "@/components/LessonDetail";
 import StudentProgress from "@/components/StudentProgress";
@@ -9,6 +8,7 @@ import ConfirmDialog from "@/components/ConfirmDialog";
 
 const TEACHER_ID = 1;
 const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
+const WS_BASE = process.env.NEXT_PUBLIC_WS_URL ?? "ws://localhost:8000";
 
 type Tab = "lessons" | "students" | "sessions" | "chat";
 
@@ -21,12 +21,155 @@ interface Lesson {
   file_count: number;
 }
 
-interface SessionAnalytics {
-  session_id: number;
-  total_pupils: number;
-  avg_understanding_score: number | null;
-  total_questions_asked: number;
-  quiz_completion_rate: number | null;
+interface SessionInfo {
+  id: number;
+  title: string;
+  status: "live" | "ended";
+}
+
+interface TranscriptChunkResponse {
+  id: number;
+  content: string;
+  timestamp_ms: number;
+}
+
+type WaveState = "paused" | "waiting" | "listening" | "error";
+
+const WAVE_BAR_COUNT = 32;
+const IDLE_WAVE = Array.from({ length: WAVE_BAR_COUNT }, (_, idx) => 0.1 + ((idx % 5) * 0.025));
+const TRANSCRIBE_MIN_CHUNK_SECONDS = 0.6;
+const TRANSCRIBE_MAX_CHUNK_SECONDS = 6;
+const TRANSCRIBE_MIN_RMS = 0.0015;
+const TRANSCRIBE_VOICE_ON_RMS = 0.003;
+const TRANSCRIBE_VOICE_OFF_RMS = 0.002;
+const TRANSCRIBE_SILENCE_HOLD_SECONDS = 0.35;
+
+function writeWavHeader(view: DataView, sampleCount: number, sampleRate: number) {
+  const writeString = (offset: number, value: string) => {
+    for (let i = 0; i < value.length; i += 1) {
+      view.setUint8(offset + i, value.charCodeAt(i));
+    }
+  };
+
+  writeString(0, "RIFF");
+  view.setUint32(4, 36 + sampleCount * 2, true);
+  writeString(8, "WAVE");
+  writeString(12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeString(36, "data");
+  view.setUint32(40, sampleCount * 2, true);
+}
+
+function encodeWav(chunks: Float32Array[], sampleRate: number) {
+  const sampleCount = chunks.reduce((total, chunk) => total + chunk.length, 0);
+  const buffer = new ArrayBuffer(44 + sampleCount * 2);
+  const view = new DataView(buffer);
+  writeWavHeader(view, sampleCount, sampleRate);
+
+  let offset = 44;
+  for (const chunk of chunks) {
+    for (let i = 0; i < chunk.length; i += 1) {
+      const sample = Math.max(-1, Math.min(1, chunk[i]));
+      view.setInt16(offset, sample < 0 ? sample * 0x8000 : sample * 0x7fff, true);
+      offset += 2;
+    }
+  }
+
+  return buffer;
+}
+
+function rmsLevel(chunk: Float32Array) {
+  if (chunk.length === 0) return 0;
+  let total = 0;
+  for (let i = 0; i < chunk.length; i += 1) {
+    total += chunk[i] * chunk[i];
+  }
+  return Math.sqrt(total / chunk.length);
+}
+
+function WaveformCard({ state, levels }: { state: WaveState; levels: number[] }) {
+  const dotColor = state === "error"
+    ? "var(--error)"
+    : state === "listening"
+      ? "var(--action)"
+      : state === "waiting"
+        ? "rgba(58,102,219,0.45)"
+        : "var(--ink-muted)";
+
+  const stateLabel = state === "error"
+    ? "Mic Error"
+    : state === "listening"
+      ? "Listening"
+      : state === "waiting"
+        ? "Waiting…"
+        : "Paused";
+
+  return (
+    <div
+      style={{
+        background: "var(--paper-shade)",
+        borderRadius: 14,
+        padding: "16px 18px",
+        display: "flex",
+        alignItems: "center",
+        gap: 14,
+      }}
+    >
+      <span
+        aria-hidden="true"
+        style={{
+          width: 10,
+          height: 10,
+          borderRadius: 999,
+          flex: "none",
+          background: dotColor,
+          boxShadow: state === "listening" ? "0 0 0 0 rgba(58,102,219,.45)" : "none",
+          animation: state === "listening" ? "ll-wave-pulse 1.4s ease-out infinite" : "none",
+        }}
+      />
+      <div style={{ flex: 1, height: 56, display: "flex", alignItems: "center", gap: 4 }}>
+        {levels.map((level, idx) => (
+          <span
+            key={`${idx}-${level.toFixed(3)}`}
+            aria-hidden="true"
+            style={{
+              flex: 1,
+              minHeight: 4,
+              height: `${6 + level * 42}px`,
+              borderRadius: 3,
+              background: state === "error"
+                ? "var(--error)"
+                : state === "paused"
+                  ? "rgba(43,43,43,0.3)"
+                  : state === "waiting"
+                    ? "rgba(58,102,219,0.45)"
+                    : "var(--action)",
+              transformOrigin: "center",
+              transition: "height .12s ease, background-color .2s ease",
+            }}
+          />
+        ))}
+      </div>
+      <div
+        style={{
+          font: "600 11px/12px var(--font-sans)",
+          color: "var(--ink-muted)",
+          textTransform: "uppercase",
+          letterSpacing: "0.08em",
+          minWidth: 84,
+          textAlign: "right",
+        }}
+      >
+        {stateLabel}
+      </div>
+    </div>
+  );
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -160,66 +303,517 @@ function LessonsPanel({ teacherId }: { teacherId: number }) {
   );
 }
 
-function SessionsPanel() {
-  const [sessions, setSessions] = useState<SessionAnalytics[]>([]);
-  const [loading, setLoading] = useState(true);
+function SessionsPanel({ teacherId }: { teacherId: number }) {
+  const [lessons, setLessons] = useState<Lesson[]>([]);
+  const [selectedLessonId, setSelectedLessonId] = useState<number | null>(null);
+  const [activeSession, setActiveSession] = useState<SessionInfo | null>(null);
+  const [starting, setStarting] = useState(false);
+  const [stopping, setStopping] = useState(false);
+  const [liveTranscripts, setLiveTranscripts] = useState<string[]>([]);
+  const [sessionError, setSessionError] = useState<string | null>(null);
+  const [waveLevels, setWaveLevels] = useState<number[]>(IDLE_WAVE);
+  const [waveState, setWaveState] = useState<WaveState>("paused");
+  const socketRef = useRef<WebSocket | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const activeSessionIdRef = useRef<number | null>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const processorRef = useRef<ScriptProcessorNode | null>(null);
+  const gainRef = useRef<GainNode | null>(null);
+  const animationFrameRef = useRef<number | null>(null);
+  const audioChunksRef = useRef<Float32Array[]>([]);
+  const chunkDurationSecondsRef = useRef<number>(0);
+  const silenceDurationSecondsRef = useRef<number>(0);
+  const speechActiveRef = useRef<boolean>(false);
+  const lastFlushAtRef = useRef<number>(0);
+  const sampleRateRef = useRef<number>(16000);
+  const transcriptContainerRef = useRef<HTMLDivElement>(null);
+  const transcriptEndRef = useRef<HTMLDivElement>(null);
+  const shouldAutoScrollRef = useRef(true);
 
   useEffect(() => {
-    (async () => {
-      try {
-        const res = await fetch(`${API}/teacher/sessions`);
-        const list = await res.json() as Array<{ session_id: number }>;
-        const details = await Promise.all(
-          list.map((s) =>
-            fetch(`${API}/teacher/sessions/${s.session_id}/analytics`).then((r) => r.json())
-          )
-        );
-        setSessions(details);
-      } catch (e) {
-        console.error(e);
-      } finally {
-        setLoading(false);
-      }
-    })();
+    const transcriptContainer = transcriptContainerRef.current;
+    if (!transcriptContainer || !shouldAutoScrollRef.current) return;
+    transcriptContainer.scrollTop = transcriptContainer.scrollHeight;
+  }, [liveTranscripts]);
+
+  const applyPersistedTranscript = useCallback((sessionId: number, persistedLines: string[]) => {
+    setLiveTranscripts((prev) => {
+      const isActiveSession = activeSessionIdRef.current === sessionId;
+      if (!isActiveSession) return persistedLines;
+
+      // Keep already-rendered live lines while a running session catches up in DB.
+      if (persistedLines.length === 0 && prev.length > 0) return prev;
+      if (persistedLines.length < prev.length) return prev;
+
+      return persistedLines;
+    });
   }, []);
 
-  if (loading) return <p className="ll-body" style={{ color: "var(--ink-muted)" }}>Loading sessions…</p>;
+  useEffect(() => {
+    fetch(`${API}/teacher/lessons?teacher_id=${teacherId}`)
+      .then((r) => r.json())
+      .then((data: Lesson[]) => {
+        setLessons(data);
+        if (data.length > 0) {
+          setSelectedLessonId((prev) => prev ?? data[0].id);
+        }
+      })
+      .catch((e) => {
+        console.error(e);
+        setSessionError("Could not load lessons for session start.");
+      });
+  }, [teacherId]);
+
+  useEffect(() => {
+    return () => {
+      const socket = socketRef.current;
+      const stream = streamRef.current;
+      if (stream) stream.getTracks().forEach((track) => track.stop());
+      if (socket && socket.readyState === WebSocket.OPEN) socket.close();
+      if (animationFrameRef.current !== null) cancelAnimationFrame(animationFrameRef.current);
+      processorRef.current?.disconnect();
+      analyserRef.current?.disconnect();
+      gainRef.current?.disconnect();
+      void audioContextRef.current?.close();
+    };
+  }, []);
+
+  const refreshTranscript = useCallback(async (sessionId: number) => {
+    try {
+      const res = await fetch(`${API}/session/${sessionId}/transcript`);
+      if (!res.ok) return;
+      const data = await res.json() as TranscriptChunkResponse[];
+      applyPersistedTranscript(sessionId, data.map((chunk) => chunk.content));
+    } catch (error) {
+      console.error(error);
+    }
+  }, [applyPersistedTranscript]);
+
+  useEffect(() => {
+    if (!activeSession?.id) return;
+
+    let cancelled = false;
+    const sessionId = activeSession.id;
+
+    const loadTranscript = async () => {
+      try {
+        const res = await fetch(`${API}/session/${sessionId}/transcript`);
+        if (!res.ok) return;
+        const data = await res.json() as TranscriptChunkResponse[];
+        if (!cancelled) {
+          applyPersistedTranscript(sessionId, data.map((chunk) => chunk.content));
+        }
+      } catch (error) {
+        console.error(error);
+      }
+    };
+
+    void loadTranscript();
+    const intervalId = window.setInterval(() => {
+      void loadTranscript();
+    }, 500);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(intervalId);
+    };
+  }, [activeSession?.id, applyPersistedTranscript]);
+
+  const resetAudioPipeline = useCallback(() => {
+    if (animationFrameRef.current !== null) {
+      cancelAnimationFrame(animationFrameRef.current);
+      animationFrameRef.current = null;
+    }
+    processorRef.current?.disconnect();
+    analyserRef.current?.disconnect();
+    gainRef.current?.disconnect();
+    void audioContextRef.current?.close();
+    processorRef.current = null;
+    analyserRef.current = null;
+    gainRef.current = null;
+    audioContextRef.current = null;
+    audioChunksRef.current = [];
+    chunkDurationSecondsRef.current = 0;
+    silenceDurationSecondsRef.current = 0;
+    speechActiveRef.current = false;
+    lastFlushAtRef.current = 0;
+    setWaveLevels(IDLE_WAVE);
+    setWaveState(sessionError ? "error" : "paused");
+  }, [sessionError]);
+
+  const flushAudioChunk = useCallback((force = false): boolean => {
+    const socket = socketRef.current;
+    const audioContext = audioContextRef.current;
+    const chunks = audioChunksRef.current;
+    if (!socket || socket.readyState !== WebSocket.OPEN || !audioContext || chunks.length === 0) {
+      return false;
+    }
+
+    const sampleCount = chunks.reduce((total, chunk) => total + chunk.length, 0);
+    if (!force && sampleCount < sampleRateRef.current * TRANSCRIBE_MIN_CHUNK_SECONDS) {
+      return false;
+    }
+
+    const mergedRms = chunks.reduce((max, chunk) => Math.max(max, rmsLevel(chunk)), 0);
+    if (!force && mergedRms < TRANSCRIBE_MIN_RMS) {
+      audioChunksRef.current = [];
+      chunkDurationSecondsRef.current = 0;
+      silenceDurationSecondsRef.current = 0;
+      speechActiveRef.current = false;
+      return false;
+    }
+
+    socket.send(encodeWav(chunks, sampleRateRef.current));
+    audioChunksRef.current = [];
+    chunkDurationSecondsRef.current = 0;
+    silenceDurationSecondsRef.current = 0;
+    speechActiveRef.current = false;
+    if (activeSessionIdRef.current != null) {
+      window.setTimeout(() => {
+        void refreshTranscript(activeSessionIdRef.current as number);
+      }, 250);
+    }
+    lastFlushAtRef.current = audioContext.currentTime;
+    return true;
+  }, [refreshTranscript]);
+
+  const startWaveAnimation = useCallback(() => {
+    const analyser = analyserRef.current;
+    if (!analyser) return;
+    const data = new Uint8Array(analyser.frequencyBinCount);
+
+    const tick = () => {
+      analyser.getByteFrequencyData(data);
+      const stride = Math.max(1, Math.floor(data.length / WAVE_BAR_COUNT));
+      const nextLevels = Array.from({ length: WAVE_BAR_COUNT }, (_, idx) => {
+        const start = idx * stride;
+        const end = Math.min(start + stride, data.length);
+        let total = 0;
+        for (let i = start; i < end; i += 1) total += data[i];
+        return Math.max(0.08, Math.min(1, (total / Math.max(1, end - start)) / 255));
+      });
+      const level = nextLevels.reduce((sum, value) => sum + value, 0) / nextLevels.length;
+      setWaveLevels(nextLevels);
+      setWaveState((prev) => {
+        if (prev === "error") return prev;
+        if (!activeSession) return "paused";
+        return level > 0.18 ? "listening" : "waiting";
+      });
+      animationFrameRef.current = requestAnimationFrame(tick);
+    };
+
+    animationFrameRef.current = requestAnimationFrame(tick);
+  }, [activeSession]);
+
+  const startLiveSession = async () => {
+    if (selectedLessonId == null) {
+      setSessionError("Select a lesson before starting a session.");
+      return;
+    }
+
+    setStarting(true);
+    setSessionError(null);
+
+    try {
+      const lesson = lessons.find((l) => l.id === selectedLessonId);
+      const response = await fetch(`${API}/session/start`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          teacher_id: teacherId,
+          lesson_id: selectedLessonId,
+          title: lesson ? `Live: ${lesson.title}` : undefined,
+        }),
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(errorText || "Failed to start session.");
+      }
+
+      const session = (await response.json()) as SessionInfo;
+      activeSessionIdRef.current = session.id;
+
+      const mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      streamRef.current = mediaStream;
+      const ws = new WebSocket(`${WS_BASE}/teacher/ws/${teacherId}/transcribe/${session.id}`);
+      socketRef.current = ws;
+      setWaveState("waiting");
+
+      ws.onopen = () => {
+        const audioContext = new AudioContext({ sampleRate: 16000 });
+        const source = audioContext.createMediaStreamSource(mediaStream);
+        const analyser = audioContext.createAnalyser();
+        analyser.fftSize = 128;
+        analyser.smoothingTimeConstant = 0.75;
+
+        const processor = audioContext.createScriptProcessor(4096, 1, 1);
+        const gain = audioContext.createGain();
+        gain.gain.value = 0;
+
+        sampleRateRef.current = audioContext.sampleRate;
+        audioContextRef.current = audioContext;
+        analyserRef.current = analyser;
+        processorRef.current = processor;
+        gainRef.current = gain;
+        audioChunksRef.current = [];
+        chunkDurationSecondsRef.current = 0;
+        silenceDurationSecondsRef.current = 0;
+        speechActiveRef.current = false;
+        lastFlushAtRef.current = audioContext.currentTime;
+
+        void audioContext.resume();
+
+        source.connect(analyser);
+        analyser.connect(processor);
+        processor.connect(gain);
+        gain.connect(audioContext.destination);
+
+        processor.onaudioprocess = (event) => {
+          const input = event.inputBuffer.getChannelData(0);
+          const copy = new Float32Array(input.length);
+          copy.set(input);
+          const seconds = copy.length / sampleRateRef.current;
+          const level = rmsLevel(copy);
+          const speechDetected = level >= TRANSCRIBE_VOICE_ON_RMS;
+          const silenceDetected = level < TRANSCRIBE_VOICE_OFF_RMS;
+
+          if (speechDetected) {
+            speechActiveRef.current = true;
+            silenceDurationSecondsRef.current = 0;
+          }
+
+          if (!speechActiveRef.current) {
+            return;
+          }
+
+          audioChunksRef.current.push(copy);
+          chunkDurationSecondsRef.current += seconds;
+
+          if (silenceDetected) {
+            silenceDurationSecondsRef.current += seconds;
+          } else {
+            silenceDurationSecondsRef.current = 0;
+          }
+
+          // End segment at a natural pause once minimum segment length is reached.
+          if (
+            silenceDurationSecondsRef.current >= TRANSCRIBE_SILENCE_HOLD_SECONDS
+            && chunkDurationSecondsRef.current >= TRANSCRIBE_MIN_CHUNK_SECONDS
+          ) {
+            flushAudioChunk();
+            return;
+          }
+
+          // Safety flush for very long uninterrupted speech.
+          if (chunkDurationSecondsRef.current >= TRANSCRIBE_MAX_CHUNK_SECONDS) {
+            flushAudioChunk();
+          }
+        };
+
+        startWaveAnimation();
+      };
+
+      ws.onmessage = (evt) => {
+        try {
+          const payload = JSON.parse(evt.data) as {
+            type?: string;
+            text?: string;
+            detail?: string;
+          };
+          if (payload.type === "transcript" && payload.text) {
+            setLiveTranscripts((prev) => [...prev.slice(-20), payload.text as string]);
+            setSessionError(null);
+            void refreshTranscript(session.id);
+          }
+          if (payload.type === "rationalized" && payload.text && typeof (payload as { replaces?: number }).replaces === "number") {
+            const replaces = (payload as { replaces: number }).replaces;
+            setLiveTranscripts((prev) => [
+              ...prev.slice(0, Math.max(0, prev.length - replaces)),
+              `✦ ${payload.text as string}`,
+            ]);
+          }
+          if (payload.type === "error") {
+            setSessionError(payload.detail ?? "Transcription error.");
+            setWaveState("error");
+          }
+        } catch {
+          // Ignore non-JSON frames.
+        }
+      };
+
+      ws.onerror = () => {
+        setSessionError("Transcription socket failed.");
+        setWaveState("error");
+      };
+
+      ws.onclose = () => {
+        flushAudioChunk(true);
+        mediaStream.getTracks().forEach((track) => track.stop());
+        socketRef.current = null;
+        streamRef.current = null;
+        resetAudioPipeline();
+      };
+
+      setActiveSession(session);
+      setLiveTranscripts([]);
+    } catch (e) {
+      console.error(e);
+      setSessionError(e instanceof Error ? e.message : "Could not start live session.");
+      setWaveState("error");
+    } finally {
+      setStarting(false);
+    }
+  };
+
+  const stopLiveSession = async () => {
+    if (!activeSession) return;
+    setStopping(true);
+    setSessionError(null);
+
+    try {
+      const socket = socketRef.current;
+      const stream = streamRef.current;
+
+      flushAudioChunk(true);
+      if (socket && socket.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify({ type: "end_session" }));
+      }
+      if (stream) stream.getTracks().forEach((track) => track.stop());
+      if (socket) socket.close();
+
+      await fetch(`${API}/session/${activeSession.id}/end`, { method: "POST" });
+      await refreshTranscript(activeSession.id);
+      socketRef.current = null;
+      streamRef.current = null;
+      activeSessionIdRef.current = null;
+      setActiveSession(null);
+      resetAudioPipeline();
+    } catch (e) {
+      console.error(e);
+      setSessionError("Could not end the active session.");
+      setWaveState("error");
+    } finally {
+      setStopping(false);
+    }
+  };
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 24 }}>
       <h2 className="ll-heading">Sessions</h2>
-      {sessions.length === 0 ? (
-        <p className="ll-body" style={{ color: "var(--ink-muted)" }}>No sessions yet.</p>
-      ) : (
-        <div
-          style={{
-            display: "grid",
-            gridTemplateColumns: "repeat(auto-fill, minmax(260px, 1fr))",
-            gap: 16,
-          }}
-        >
-          {sessions.map((s) => (
-            <div key={s.session_id} className="ll-card">
-              <p className="ll-label" style={{ marginBottom: 12 }}>Session {s.session_id}</p>
-              <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-                <Row label="Pupils" value={String(s.total_pupils)} />
-                <Row label="Avg understanding" value={pct(s.avg_understanding_score)} />
-                <Row label="Questions asked" value={String(s.total_questions_asked)} />
-                <Row label="Quiz completion" value={pct(s.quiz_completion_rate)} />
-              </div>
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
 
-function Row({ label, value }: { label: string; value: string }) {
-  return (
-    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
-      <span style={{ fontSize: 14, color: "var(--ink-muted)" }}>{label}</span>
-      <span className="ll-subheading" style={{ fontSize: 15 }}>{value}</span>
+      <div className="ll-card" style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+        <p className="ll-label">Start live session</p>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 12, alignItems: "center" }}>
+          <select
+            value={selectedLessonId ?? ""}
+            onChange={(e) => setSelectedLessonId(Number(e.target.value))}
+            disabled={activeSession !== null || lessons.length === 0}
+            style={{
+              minWidth: 260,
+              border: "1px solid var(--ink-soft)",
+              borderRadius: "var(--radius-md)",
+              padding: "10px 12px",
+              fontFamily: "var(--font-sans)",
+              fontSize: 14,
+              background: "var(--paper)",
+            }}
+          >
+            {lessons.map((lesson) => (
+              <option key={lesson.id} value={lesson.id}>{lesson.title}</option>
+            ))}
+          </select>
+
+          {activeSession ? (
+            <button className="ll-chip" onClick={stopLiveSession} disabled={stopping}>
+              {stopping ? "Stopping…" : `Stop Session #${activeSession.id}`}
+            </button>
+          ) : (
+            <button className="ll-chip" onClick={startLiveSession} disabled={starting || lessons.length === 0}>
+              {starting ? "Starting…" : "Start Session + Transcription"}
+            </button>
+          )}
+        </div>
+
+        {activeSession && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+            <p className="ll-body" style={{ color: "var(--ink-muted)" }}>
+              Live now: {activeSession.title} (session {activeSession.id})
+            </p>
+            <WaveformCard state={waveState} levels={waveLevels} />
+          </div>
+        )}
+
+        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          <p className="ll-label">Live transcript</p>
+          {liveTranscripts.length === 0 ? (
+            <div
+              style={{
+                padding: "16px 18px",
+                borderRadius: 14,
+                background: "var(--paper-shade)",
+                color: "var(--ink-muted)",
+              }}
+            >
+              {activeSession ? "Listening for speech… transcript will appear here in real time." : "Start a live session to see transcript updates."}
+            </div>
+          ) : (
+            <div
+              ref={transcriptContainerRef}
+              onScroll={(event) => {
+                const element = event.currentTarget;
+                const distanceFromBottom = element.scrollHeight - element.scrollTop - element.clientHeight;
+                shouldAutoScrollRef.current = distanceFromBottom < 48;
+              }}
+              style={{
+                display: "flex",
+                flexDirection: "column",
+                gap: 8,
+                maxHeight: 340,
+                overflowY: "auto",
+                paddingRight: 4,
+              }}
+            >
+              {liveTranscripts.map((line, idx) => {
+                const isLatest = idx === liveTranscripts.length - 1;
+                const isRationalized = line.startsWith("✦ ");
+                const displayLine = isRationalized ? line.slice(2).trimStart() : line;
+                return (
+                <div
+                  key={`${idx}-${line.slice(0, 12)}`}
+                  style={{
+                    background: isRationalized ? "var(--paper)" : "var(--paper-shade)",
+                    borderRadius: 14,
+                    padding: "14px 16px",
+                    borderLeft: isLatest
+                      ? "4px solid var(--action)"
+                      : isRationalized
+                      ? "4px solid var(--ink-muted)"
+                      : "4px solid transparent",
+                  }}
+                >
+                  <p
+                    className="ll-body"
+                    style={{
+                      color: isLatest ? "var(--ink)" : "var(--ink-muted)",
+                      fontStyle: isRationalized ? "italic" : "normal",
+                    }}
+                  >
+                    {displayLine}
+                  </p>
+                </div>
+                );
+              })}
+              <div ref={transcriptEndRef} />
+            </div>
+          )}
+        </div>
+
+        {sessionError && (
+          <p className="ll-body" style={{ color: "var(--error)" }}>{sessionError}</p>
+        )}
+      </div>
     </div>
   );
 }
@@ -302,7 +896,7 @@ export default function TeacherDashboard() {
       >
         {tab === "lessons"  && <LessonsPanel teacherId={TEACHER_ID} />}
         {tab === "students" && <StudentProgress />}
-        {tab === "sessions" && <SessionsPanel />}
+        {tab === "sessions" && <SessionsPanel teacherId={TEACHER_ID} />}
         {tab === "chat"     && (
           <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" }}>
             <h2 className="ll-heading" style={{ marginBottom: 24 }}>AI Assistant</h2>
