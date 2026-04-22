@@ -88,8 +88,9 @@ class StudentProgress(BaseModel):
 # ── Lesson Sessions (live transcription) ───────────────────────────────────
 
 class SessionCreate(BaseModel):
-    title: str = Field(..., min_length=1, max_length=255)
+    title: str | None = Field(default=None, min_length=1, max_length=255)
     teacher_id: int
+    lesson_id: int
 
 
 class SessionResponse(BaseModel):

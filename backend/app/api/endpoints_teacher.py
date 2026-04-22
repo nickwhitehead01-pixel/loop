@@ -13,9 +13,13 @@ WS   /teacher/ws/{teacher_id}/transcribe/{session_id} — live classroom transcr
 """
 from __future__ import annotations
 
+import asyncio
+from difflib import get_close_matches
 import json
 import logging
 from pathlib import Path
+import re
+import time
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
@@ -26,11 +30,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.agents.teacher_graph import run_teacher_agent
 from app.agents.teacher_rag import process_lesson, summarise_lesson
 from app.core.config import settings
-from app.core.database import get_db
+from app.core.database import AsyncSessionLocal, get_db
 from app.services import transcription
 from app.models.domain import (
     Conversation,
     Lesson,
+    LessonChunk,
     LessonFile,
     LessonSession,
     Message,
@@ -51,6 +56,133 @@ from app.models.schemas import (
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/teacher", tags=["teacher"])
+
+
+def _build_lesson_glossary(chunks: list[str]) -> dict[str, str]:
+    """Build a small canonical-term glossary from lesson content for transcript cleanup."""
+    joined = " ".join(chunks)
+    phrases = re.findall(r"\b(?:[A-Z][a-z']+)(?:\s+[A-Z][a-z']+){0,2}\b", joined)
+
+    glossary: dict[str, str] = {}
+    for phrase in phrases:
+        canonical = phrase.strip()
+        if len(canonical) < 4:
+            continue
+        key = re.sub(r"[^a-z0-9]+", "", canonical.lower())
+        if len(key) < 4 or key in glossary:
+            continue
+        glossary[key] = canonical
+        if len(glossary) >= 12:
+            break
+
+    return glossary
+
+
+def _fast_rationalize(text: str, glossary: dict[str, str]) -> str:
+    """Apply lightweight cleanup and lesson-aware term correction with no model call."""
+    cleaned = re.sub(r"\b(?:um+|uh+|er+|ah+)\b", "", text, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" ,.;:-")
+    if not cleaned:
+        return ""
+
+    words = cleaned.split()
+    corrected: list[str] = []
+    index = 0
+    glossary_keys = list(glossary.keys())
+
+    while index < len(words):
+        replaced = False
+        for size in (3, 2, 1):
+            if index + size > len(words):
+                continue
+            phrase = " ".join(words[index:index + size])
+            normalized = re.sub(r"[^a-z0-9]+", "", phrase.lower())
+            if len(normalized) < 4:
+                continue
+
+            matches = get_close_matches(normalized, glossary_keys, n=1, cutoff=0.82)
+            if matches:
+                corrected.append(glossary[matches[0]])
+                index += size
+                replaced = True
+                break
+
+        if not replaced:
+            corrected.append(words[index])
+            index += 1
+
+    cleaned = " ".join(corrected)
+    cleaned = re.sub(r"\s+([,.;:!?])", r"\1", cleaned)
+    if cleaned and cleaned[-1] not in ".!?":
+        cleaned = f"{cleaned}."
+    if cleaned:
+        cleaned = cleaned[0].upper() + cleaned[1:]
+
+    return cleaned
+
+async def _rationalize_and_send(
+    websocket: WebSocket,
+    chunks: list[str],
+    session_title: str,
+    lesson_glossary: dict[str, str],
+) -> None:
+    """Clean up a batch of raw STT chunks quickly and send a rationalized frame."""
+    joined = " ".join(chunks)
+    cleaned = _fast_rationalize(joined, lesson_glossary)
+    try:
+        cleaned = cleaned.strip()
+        if cleaned:
+            await websocket.send_json({
+                "type": "rationalized",
+                "text": cleaned,
+                "replaces": len(chunks),
+            })
+    except Exception as exc:
+        logger.warning("Rationalization failed: %s", exc)
+
+
+def _incremental_transcript(previous: str, current: str) -> str:
+    previous = previous.strip()
+    current = current.strip()
+    if not current:
+        return ""
+    if not previous:
+        return current
+    if current.startswith(previous):
+        return current[len(previous):].strip()
+
+    max_overlap = min(len(previous), len(current))
+    for overlap in range(max_overlap, 0, -1):
+        if previous.endswith(current[:overlap]):
+            return current[overlap:].strip()
+
+    return current
+
+
+async def _persist_transcript_chunk(session_id: int, content: str, timestamp_ms: int) -> None:
+    """Persist transcript chunks asynchronously so websocket throughput stays realtime."""
+    if not content:
+        return
+
+    from app.services import ollama_client
+
+    try:
+        vector = await ollama_client.embed(content)
+        async with AsyncSessionLocal() as persist_db:
+            chunk = TranscriptChunk(
+                session_id=session_id,
+                content=content,
+                embedding=vector,
+                timestamp_ms=timestamp_ms,
+            )
+            persist_db.add(chunk)
+            await persist_db.commit()
+    except Exception as exc:
+        logger.warning(
+            "Transcript persistence failed for session %d: %s",
+            session_id,
+            exc,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -173,7 +305,6 @@ async def get_lesson_detail(
     files = files_result.scalars().all()
 
     # Load indexed chunks (content only — skip the embedding vector)
-    from app.models.domain import LessonChunk
     chunks_result = await db.execute(
         select(LessonChunk.id, LessonChunk.content)
         .where(LessonChunk.lesson_id == lesson_id)
@@ -546,6 +677,45 @@ async def teacher_transcribe(
     """
     await websocket.accept()
     logger.info("Teacher %d starting live transcription for session %d", teacher_id, session_id)
+    last_emitted_text = ""
+    session_started_monotonic = time.monotonic()
+
+    # Fetch session title and lesson material for rationalization context
+    sess_result = await db.execute(select(LessonSession).where(LessonSession.id == session_id))
+    _sess = sess_result.scalar_one_or_none()
+    session_title = _sess.title if _sess else "Classroom lesson"
+
+    # Gather a compact lesson glossary linked to this session.
+    lesson_glossary: dict[str, str] = {}
+    try:
+        chunks_result = await db.execute(
+            select(LessonChunk.content)
+            .join(Lesson, Lesson.id == LessonChunk.lesson_id)
+            .where(Lesson.session_id == session_id)
+            .limit(12)
+        )
+        chunk_texts = [row[0] for row in chunks_result.all()]
+        lesson_glossary = _build_lesson_glossary(chunk_texts)
+    except Exception:
+        pass  # Context is optional — never block transcription
+
+    raw_buffer: list[str] = []
+    rationalize_in_flight = False
+
+    async def maybe_rationalize() -> None:
+        nonlocal raw_buffer, rationalize_in_flight
+        if rationalize_in_flight or len(raw_buffer) < 2:
+            return
+
+        batch = raw_buffer[:2]
+        rationalize_in_flight = True
+        try:
+            await _rationalize_and_send(websocket, batch, session_title, lesson_glossary)
+            raw_buffer = raw_buffer[len(batch):]
+        finally:
+            rationalize_in_flight = False
+            if len(raw_buffer) >= 2:
+                asyncio.create_task(maybe_rationalize())
 
     try:
         while True:
@@ -556,43 +726,57 @@ async def teacher_transcribe(
                 audio_bytes = message["bytes"]
                 try:
                     result = await transcription.transcribe_chunk(audio_bytes)
+                    full_text = result.text.strip()
+                    emit_text = ""
+                    if full_text and full_text != last_emitted_text:
+                        emit_text = full_text
+                        last_emitted_text = full_text
                     logger.info(
-                        "Transcribed [lang=%s]: %.60s",
+                        "Transcribed [lang=%s chunk_len=%d emit_len=%d]: %.60s",
                         result.language,
-                        result.text,
+                        len(full_text),
+                        len(emit_text),
+                        full_text,
                     )
 
-                    # Embed and store in TranscriptChunk
-                    if result.text.strip():
-                        from app.services import ollama_client
-
-                        vector = await ollama_client.embed(result.text)
-                        chunk = TranscriptChunk(
-                            session_id=session_id,
-                            content=result.text,
-                            embedding=vector,
-                            timestamp_ms=0,  # TODO: track cumulative timestamp
-                        )
-                        db.add(chunk)
-                        await db.flush()
-
-                        # Send back to teacher (and eventually broadcast to pupils)
+                    # Send transcript to the teacher immediately so UI updates do not depend
+                    # on embedding or DB latency.
+                    timestamp_ms = int((time.monotonic() - session_started_monotonic) * 1000)
+                    if emit_text:
                         await websocket.send_json({
                             "type": "transcript",
-                            "text": result.text,
+                            "text": emit_text,
                             "language": result.language,
-                            "timestamp_ms": 0,
+                            "timestamp_ms": timestamp_ms,
                         })
+
+                        # Persist asynchronously so embedding/database work does not block
+                        # the next incoming audio chunk.
+                        asyncio.create_task(_persist_transcript_chunk(session_id, emit_text, timestamp_ms))
+
+                        # Buffer raw chunks and rationalize in small serialized batches.
+                        raw_buffer.append(emit_text)
+                        if len(raw_buffer) > 6:
+                            raw_buffer = raw_buffer[-6:]
+                        asyncio.create_task(maybe_rationalize())
                     else:
                         await websocket.send_json({
                             "type": "silent",
                             "message": "[silence detected]",
                         })
 
+                except WebSocketDisconnect:
+                    await db.commit()
+                    logger.info("Teacher %d disconnected during transcription for session %d", teacher_id, session_id)
+                    break
                 except Exception as exc:
                     logger.error("Transcription error: %s", exc)
-                    await websocket.send_json({"type": "error", "detail": str(exc)})
                     await db.rollback()
+                    try:
+                        await websocket.send_json({"type": "error", "detail": str(exc)})
+                    except RuntimeError:
+                        logger.info("Teacher %d socket already closed for session %d", teacher_id, session_id)
+                        break
 
             # Text message: control command (optional)
             elif "text" in message:
