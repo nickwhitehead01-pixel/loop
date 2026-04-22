@@ -25,6 +25,15 @@ ACCEPTED_EXTENSIONS = {".pdf", ".docx", ".pptx", ".txt"}
 
 
 # ---------------------------------------------------------------------------
+# Text sanitization — remove invalid UTF-8 characters
+# ---------------------------------------------------------------------------
+
+def _sanitize_text(text: str) -> str:
+    """Remove null bytes and other problematic characters that break UTF-8 encoding."""
+    return "".join(char if ord(char) >= 32 or char in "\n\r\t" else " " for char in text)
+
+
+# ---------------------------------------------------------------------------
 # Text extraction — one function per format
 # ---------------------------------------------------------------------------
 
@@ -34,6 +43,7 @@ def _extract_pdf(data: bytes) -> str:
     for page in reader.pages:
         text = page.extract_text()
         if text:
+            text = _sanitize_text(text)
             pages.append(text)
     return "\n\n".join(pages)
 
@@ -41,7 +51,7 @@ def _extract_pdf(data: bytes) -> str:
 def _extract_docx(data: bytes) -> str:
     from docx import Document  # python-docx
     doc = Document(BytesIO(data))
-    paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
+    paragraphs = [_sanitize_text(p.text) for p in doc.paragraphs if p.text.strip()]
     return "\n\n".join(paragraphs)
 
 
@@ -54,7 +64,7 @@ def _extract_pptx(data: bytes) -> str:
         for shape in slide.shapes:
             if shape.has_text_frame:
                 for para in shape.text_frame.paragraphs:
-                    line = para.text.strip()
+                    line = _sanitize_text(para.text.strip())
                     if line:
                         texts.append(line)
         if texts:
@@ -63,7 +73,8 @@ def _extract_pptx(data: bytes) -> str:
 
 
 def _extract_txt(data: bytes) -> str:
-    return data.decode("utf-8", errors="replace")
+    text = data.decode("utf-8", errors="replace")
+    return _sanitize_text(text)
 
 
 def extract_text(file_bytes: bytes, filename: str) -> str:

@@ -46,6 +46,8 @@ class LessonResponse(BaseModel):
     teacher_id: int
     file_path: str
     file_count: int = 1
+    summary: str | None = None
+    summary_generated_at: datetime | None = None
     created_at: datetime
 
 

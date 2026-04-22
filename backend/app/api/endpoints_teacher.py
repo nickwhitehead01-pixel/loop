@@ -14,6 +14,7 @@ WS   /teacher/ws/{teacher_id}/transcribe/{session_id} — live classroom transcr
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime
 from difflib import get_close_matches
 import json
 import logging
@@ -32,6 +33,7 @@ from app.agents.teacher_rag import process_lesson, summarise_lesson
 from app.core.config import settings
 from app.core.database import AsyncSessionLocal, get_db
 from app.services import transcription
+from app.services.vector_store import ACCEPTED_EXTENSIONS
 from app.models.domain import (
     Conversation,
     Lesson,
@@ -212,6 +214,13 @@ async def upload_lesson(
     for upload in files:
         if not upload.filename:
             raise HTTPException(status_code=400, detail="Each file must have a filename")
+        # Validate file extension early
+        ext = "." + upload.filename.rsplit(".", 1)[-1].lower() if "." in upload.filename else ""
+        if ext not in ACCEPTED_EXTENSIONS:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Invalid file type '{ext}'. Accepted: {', '.join(sorted(ACCEPTED_EXTENSIONS))}"
+            )
         content = await upload.read()
         if len(content) > MAX_FILE_BYTES:
             raise HTTPException(
@@ -245,7 +254,27 @@ async def upload_lesson(
             original_filename=filename,
             file_path=str(dest),
         ))
-        await process_lesson(lesson.id, content, db, filename=filename)
+        try:
+            await process_lesson(lesson.id, content, db, filename=filename)
+        except Exception as e:
+            logger.error(f"Failed to process lesson file {filename}: {e}", exc_info=True)
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to process {filename}: {str(e)}"
+            )
+
+    await db.commit()
+
+    # Generate and persist the lesson summary after all chunks are created
+    try:
+        summary = await summarise_lesson(lesson.id, db)
+        lesson.summary = summary
+        lesson.summary_generated_at = datetime.now()
+        db.add(lesson)
+        await db.commit()
+        logger.info("Summary generated and persisted for lesson %d", lesson.id)
+    except Exception as e:
+        logger.error(f"Failed to generate summary for lesson {lesson.id}: {e}", exc_info=True)
 
     await db.commit()
     await db.refresh(lesson)
@@ -292,11 +321,19 @@ async def get_lesson_detail(
     if not lesson:
         raise HTTPException(status_code=404, detail="Lesson not found")
 
-    try:
-        summary = await summarise_lesson(lesson_id, db)
-    except Exception:
-        logger.exception("summarise_lesson failed for lesson %d", lesson_id)
-        summary = None
+    # Use persisted summary if available, otherwise generate on-demand (backward compatibility)
+    summary = lesson.summary
+    if not summary:
+        try:
+            summary = await summarise_lesson(lesson_id, db)
+            # Persist the generated summary for next time
+            if summary:
+                lesson.summary = summary
+                lesson.summary_generated_at = datetime.now()
+                await db.commit()
+        except Exception:
+            logger.exception("summarise_lesson failed for lesson %d", lesson_id)
+            summary = None
 
     # Load associated files
     files_result = await db.execute(

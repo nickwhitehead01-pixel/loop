@@ -1,0 +1,8 @@
+# Testing
+pytest==7.4.4
+pytest-asyncio==0.24.0
+pytest-cov==5.0.0
+httpx==0.28.1
+
+# Mocking
+pytest-mock==3.14.0
