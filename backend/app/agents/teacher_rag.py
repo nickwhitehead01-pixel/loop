@@ -4,10 +4,13 @@ Teacher RAG pipeline.
 Not a LangGraph graph — this is a sequential pipeline (no decision loop
 needed). It uses gemma4:e2b for reasoning on structured document analysis.
 
-process_lesson   — ingest PDF bytes into pgvector
-summarise_lesson — fetch all chunks → gemma4:e2b → structured summary
+process_lesson   — ingest document bytes into pgvector (500/50 token chunks)
+summarise_lesson — iterate chunks → gemma4:e2b 2-sentence summary per chunk
+                   → concatenate → return full lesson summary string
 """
 from __future__ import annotations
+
+import logging
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -17,21 +20,16 @@ from app.models.domain import LessonChunk
 from app.services import ollama_client
 from app.services.vector_store import ingest_lesson
 
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # System prompts
 # ---------------------------------------------------------------------------
 
-_SUMMARISE_SYSTEM = """You are an expert educational assistant helping teachers.
-Given lesson content extracted from a PDF, produce a structured summary with:
-
-1. **Topic** — one sentence describing the lesson subject
-2. **Key concepts** — bullet list of the 5–8 most important ideas
-3. **Learning objectives** — what pupils should understand after studying this
-4. **Suggested discussion questions** — 3 questions a teacher could ask the class
-
-Be concise and use language appropriate for secondary school level.
-"""
+_CHUNK_SUMMARY_SYSTEM = """You are a concise educational assistant.
+Given a passage from a lesson document, write EXACTLY 2 sentences that capture
+the most important idea in this passage. Be direct and clear — suitable for a
+teacher who wants a quick overview. Do not add headings or bullet points."""
 
 
 # ---------------------------------------------------------------------------
@@ -45,7 +43,7 @@ async def process_lesson(
     filename: str = "upload.pdf",
 ) -> int:
     """
-    Parse *pdf_bytes* (PDF, DOCX, PPTX, or TXT), embed all chunks,
+    Parse *pdf_bytes* (PDF, DOCX, PPTX, or TXT), embed all 500/50-token chunks,
     and store them in lesson_chunks. Returns the number of chunks created.
     """
     return await ingest_lesson(lesson_id, pdf_bytes, db, filename=filename)
@@ -56,33 +54,41 @@ async def summarise_lesson(
     db: AsyncSession,
 ) -> str:
     """
-    Fetch all chunks for *lesson_id*, concatenate them, and ask gemma4:e2b
-    to produce a structured lesson summary.
-    Returns the summary as a string.
+    Iterate over every chunk for *lesson_id* in order, ask gemma4:e2b for a
+    2-sentence summary of each chunk, then concatenate into a full lesson summary.
+
+    Keeping each Gemma call small (one 500-token chunk at a time) avoids
+    hitting the context window on memory-constrained hardware.
     """
     result = await db.execute(
         select(LessonChunk.content)
         .where(LessonChunk.lesson_id == lesson_id)
-        .order_by(LessonChunk.id)
+        .order_by(LessonChunk.chunk_index, LessonChunk.id)
     )
     chunks = result.scalars().all()
 
     if not chunks:
         return "No content found for this lesson."
 
-    # Concatenate all chunks — gemma4:e2b has a 32K context window
-    full_text = "\n\n".join(chunks)
+    mini_summaries: list[str] = []
+    for i, chunk_text in enumerate(chunks):
+        try:
+            messages = [{"role": "user", "content": f"Passage:\n\n{chunk_text}"}]
+            mini = await ollama_client.generate_full(
+                messages=messages,
+                model=settings.ollama_model_teacher,
+                system=_CHUNK_SUMMARY_SYSTEM,
+            )
+            if mini and mini.strip():
+                mini_summaries.append(mini.strip())
+        except Exception:
+            logger.warning(
+                "Chunk summary failed for lesson %d chunk %d — skipping",
+                lesson_id, i,
+            )
 
-    # Truncate to ~12 000 chars to stay safely within context limits
-    if len(full_text) > 12_000:
-        full_text = full_text[:12_000] + "\n\n[content truncated]"
+    if not mini_summaries:
+        return "Summary generation failed."
 
-    messages = [{"role": "user", "content": f"Lesson content:\n\n{full_text}"}]
-
-    summary = await ollama_client.generate_full(
-        messages=messages,
-        model=settings.ollama_model_teacher,
-        system=_SUMMARISE_SYSTEM,
-    )
-    return summary
+    return "\n\n".join(mini_summaries)
 

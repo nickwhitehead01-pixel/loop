@@ -152,7 +152,8 @@ class Lesson(Base):
         back_populates="lesson", cascade="all, delete-orphan"
     )
     chunks: Mapped[list[LessonChunk]] = relationship(
-        back_populates="lesson", cascade="all, delete-orphan"
+        back_populates="lesson", cascade="all, delete-orphan",
+        order_by="LessonChunk.chunk_index",
     )
 
 
@@ -180,6 +181,7 @@ class LessonChunk(Base):
     lesson_id: Mapped[int] = mapped_column(
         Integer, ForeignKey("lessons.id", ondelete="CASCADE"), nullable=False, index=True
     )
+    chunk_index: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     content: Mapped[str] = mapped_column(Text, nullable=False)
     # nomic-embed-text produces 768-dimensional vectors
     embedding: Mapped[list[float]] = mapped_column(Vector(768), nullable=False)

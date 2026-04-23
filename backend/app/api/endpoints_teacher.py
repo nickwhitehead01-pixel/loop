@@ -265,18 +265,6 @@ async def upload_lesson(
 
     await db.commit()
 
-    # Generate and persist the lesson summary after all chunks are created
-    try:
-        summary = await summarise_lesson(lesson.id, db)
-        lesson.summary = summary
-        lesson.summary_generated_at = datetime.now()
-        db.add(lesson)
-        await db.commit()
-        logger.info("Summary generated and persisted for lesson %d", lesson.id)
-    except Exception as e:
-        logger.error(f"Failed to generate summary for lesson {lesson.id}: {e}", exc_info=True)
-
-    await db.commit()
     await db.refresh(lesson)
 
     # Attach computed file_count for the response
@@ -381,6 +369,8 @@ async def delete_lesson(
     lesson = result.scalar_one_or_none()
     if not lesson:
         raise HTTPException(status_code=404, detail="Lesson not found")
+    await db.delete(lesson)
+    await db.commit()
 
 
 @router.post("/lessons/{lesson_id}/files")
@@ -436,8 +426,6 @@ async def add_files_to_lesson(
 
     await db.commit()
     return {"added": added, "count": len(added)}
-    await db.delete(lesson)
-    await db.commit()
 
 
 @router.get("/files/{file_id}")

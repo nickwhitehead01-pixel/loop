@@ -199,6 +199,14 @@ function LessonsPanel({ teacherId }: { teacherId: number }) {
 
   useEffect(() => { load(); }, [load]);
 
+  // Poll every 8 s while any lesson is still pending background analysis
+  useEffect(() => {
+    const hasPending = lessons.some((l) => l.summary === null);
+    if (!hasPending) return;
+    const id = setInterval(load, 8000);
+    return () => clearInterval(id);
+  }, [lessons, load]);
+
   const deleteLesson = async (id: number) => {
     setConfirmId(null);
     setDeleting(id);
@@ -266,10 +274,20 @@ function LessonsPanel({ teacherId }: { teacherId: number }) {
                   </button>
                 </div>
               </div>
-              {l.summary && (
+              {l.summary ? (
                 <p className="ll-body" style={{ marginTop: 8, color: "var(--ink-muted)", fontSize: 14 }}>
                   {l.summary}
                 </p>
+              ) : (
+                <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 10 }}>
+                  <svg width="13" height="13" viewBox="0 0 13 13" style={{ flexShrink: 0, animation: "ll-spin 1.1s linear infinite" }} aria-hidden="true">
+                    <circle cx="6.5" cy="6.5" r="5" fill="none" stroke="var(--ink-soft)" strokeWidth="2" />
+                    <path d="M6.5 1.5 A5 5 0 0 1 11.5 6.5" fill="none" stroke="var(--action)" strokeWidth="2" strokeLinecap="round" />
+                  </svg>
+                  <p style={{ fontSize: 13, color: "var(--ink-muted)", fontFamily: "var(--font-sans)" }}>
+                    AI analysis in progress — check back in a few minutes
+                  </p>
+                </div>
               )}
             </div>
           ))}

@@ -59,6 +59,20 @@ async def embed(text: str) -> list[float]:
     return r.json()["embeddings"][0]
 
 
+async def embed_batch(texts: list[str]) -> list[list[float]]:
+    """
+    Embed a list of texts in a single HTTP call to Ollama.
+    Returns a list of 768-dim float vectors in the same order as *texts*.
+    Much faster than calling embed() N times when ingesting document chunks.
+    """
+    r = await get_client().post(
+        "/api/embed",
+        json={"model": settings.ollama_embed_model, "input": texts},
+    )
+    r.raise_for_status()
+    return r.json()["embeddings"]
+
+
 # ---------------------------------------------------------------------------
 # Streaming generation (raw Ollama API)
 # Used by teacher_rag — pupil_graph uses ChatOllama from langchain-ollama

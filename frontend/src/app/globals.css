@@ -195,6 +195,10 @@ html, body {
   100% { box-shadow: 0 0 0 0 rgba(58, 102, 219, 0); }
 }
 
+@keyframes ll-spin {
+  to { transform: rotate(360deg); }
+}
+
 /* ---- Scrollbar (subtle) -------------------------------------------------- */
 ::-webkit-scrollbar { width: 6px; }
 ::-webkit-scrollbar-track { background: transparent; }
