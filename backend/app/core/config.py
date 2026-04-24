@@ -26,6 +26,11 @@ class Settings(BaseSettings):
     # Semantic cache — cosine similarity threshold (0–1, higher = stricter match)
     semantic_cache_threshold: float = 0.92
 
+    # Transcript bucket — accumulate small VAD utterances before embedding/storing.
+    # A chunk is committed to pgvector when EITHER threshold is reached first.
+    transcript_bucket_min_words: int = 200   # ~matches lesson document chunk size
+    transcript_bucket_max_seconds: int = 15  # safety flush for slow/quiet teachers
+
 
 settings = Settings()
 

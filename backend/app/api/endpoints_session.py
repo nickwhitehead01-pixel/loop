@@ -15,6 +15,7 @@ from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisco
 from sqlalchemy import select, func as sa_func
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.core.database import get_db
 from app.models.domain import (
     Lesson,
@@ -104,6 +105,39 @@ async def audio_stream(
     session_start = time.time()
     logger.info("Teacher audio stream connected for session %d", session_id)
 
+    # ------------------------------------------------------------------
+    # Bucket state — accumulates small VAD utterances before embedding.
+    # The frontend VAD (and live captions) are completely unaffected; we
+    # still ACK every utterance immediately.  Only the embed + DB write
+    # is deferred until the bucket is large enough to be useful for RAG.
+    # ------------------------------------------------------------------
+    bucket_utterances: list[str] = []
+    bucket_start_ms: int | None = None   # timestamp_ms of first utterance
+    bucket_opened_at: float = time.time()
+
+    async def flush_bucket() -> None:
+        nonlocal bucket_utterances, bucket_start_ms, bucket_opened_at
+        if not bucket_utterances:
+            return
+        joined = " ".join(bucket_utterances)
+        vector = await ollama_client.embed(joined)
+        db.add(TranscriptChunk(
+            session_id=session_id,
+            content=joined,
+            embedding=vector,
+            timestamp_ms=bucket_start_ms or 0,
+        ))
+        await db.flush()
+        await db.commit()
+        logger.debug(
+            "Flushed transcript bucket for session %d: %d utterances / %d words",
+            session_id, len(bucket_utterances),
+            sum(len(u.split()) for u in bucket_utterances),
+        )
+        bucket_utterances = []
+        bucket_start_ms = None
+        bucket_opened_at = time.time()
+
     try:
         while True:
             audio_bytes = await websocket.receive_bytes()
@@ -123,18 +157,8 @@ async def audio_stream(
 
             timestamp_ms = int((time.time() - session_start) * 1000)
 
-            # Embed and store
-            vector = await ollama_client.embed(result.text)
-            chunk = TranscriptChunk(
-                session_id=session_id,
-                content=result.text,
-                embedding=vector,
-                timestamp_ms=timestamp_ms,
-            )
-            db.add(chunk)
-            await db.flush()
-
-            # Acknowledge to teacher
+            # ── Live caption path (unchanged) ──────────────────────────
+            # Acknowledge to teacher immediately so captions stay snappy.
             await websocket.send_json({
                 "type": "transcript",
                 "content": result.text,
@@ -156,12 +180,32 @@ async def audio_stream(
             for ws in dead:
                 subscribers.discard(ws)
 
-            await db.commit()
+            # ── Bucket accumulation ────────────────────────────────────
+            bucket_utterances.append(result.text)
+            if bucket_start_ms is None:
+                bucket_start_ms = timestamp_ms
+
+            bucket_words = sum(len(u.split()) for u in bucket_utterances)
+            bucket_age = time.time() - bucket_opened_at
+            if (
+                bucket_words >= settings.transcript_bucket_min_words
+                or bucket_age >= settings.transcript_bucket_max_seconds
+            ):
+                await flush_bucket()
 
     except WebSocketDisconnect:
         logger.info("Teacher audio stream disconnected for session %d", session_id)
+        # Flush any remaining utterances so nothing is lost on disconnect.
+        try:
+            await flush_bucket()
+        except Exception as flush_err:
+            logger.warning("Could not flush bucket on disconnect for session %d: %s", session_id, flush_err)
     except Exception as e:
         logger.error("Audio stream error for session %d: %s", session_id, e)
+        try:
+            await flush_bucket()
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
