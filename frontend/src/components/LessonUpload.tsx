@@ -214,34 +214,66 @@ export default function LessonUpload({ teacherId, onUploaded, onCancel }: Props)
         <p style={{ color: "var(--error)", fontSize: 14 }}>{error}</p>
       )}
 
-      {uploading && progress && (
+      {uploading && (
         <div
           style={{
-            display: "flex",
-            alignItems: "center",
-            gap: 12,
-            padding: "12px 16px",
+            padding: "16px",
             background: "var(--paper-shade)",
             borderRadius: "var(--radius-md)",
             border: "1px solid var(--ink-soft)",
+            display: "flex",
+            flexDirection: "column",
+            gap: 14,
           }}
         >
-          {/* Spinner */}
-          <svg
-            width="18" height="18" viewBox="0 0 18 18"
-            style={{ flexShrink: 0, animation: "ll-spin 0.9s linear infinite" }}
-          >
-            <style>{`@keyframes ll-spin { to { transform: rotate(360deg); } }`}</style>
-            <circle cx="9" cy="9" r="7" fill="none" stroke="var(--ink-soft)" strokeWidth="2.5" />
-            <path d="M9 2 A7 7 0 0 1 16 9" fill="none" stroke="var(--action)" strokeWidth="2.5" strokeLinecap="round" />
-          </svg>
-          <div>
-            <p style={{ fontSize: 14, color: "var(--ink)", fontFamily: "var(--font-sans)" }}>{progress}</p>
-            {step === 2 && (
-              <p style={{ fontSize: 12, color: "var(--ink-muted)", marginTop: 2 }}>
-                The AI is reading and indexing your files — usually under a minute.
-              </p>
+          {/* Step 1: Upload */}
+          <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+            {step >= 2 ? (
+              <span
+                aria-hidden="true"
+                style={{
+                  width: 20, height: 20, borderRadius: "50%",
+                  background: "var(--success-soft)", flexShrink: 0,
+                  display: "flex", alignItems: "center", justifyContent: "center",
+                  fontSize: 12, color: "var(--success)", fontWeight: 700,
+                }}
+              >✓</span>
+            ) : (
+              <svg width="20" height="20" viewBox="0 0 20 20" style={{ flexShrink: 0, animation: "ll-spin 0.9s linear infinite" }} aria-hidden="true">
+                <circle cx="10" cy="10" r="8" fill="none" stroke="var(--ink-soft)" strokeWidth="2.5" />
+                <path d="M10 2 A8 8 0 0 1 18 10" fill="none" stroke="var(--action)" strokeWidth="2.5" strokeLinecap="round" />
+              </svg>
             )}
+            <div>
+              <p style={{ fontSize: 14, fontFamily: "var(--font-sans)", color: step >= 2 ? "var(--ink-muted)" : "var(--ink)", fontWeight: step >= 2 ? 400 : 500 }}>
+                {step >= 2 ? "Files uploaded" : `Uploading ${files.length} file${files.length > 1 ? "s" : ""}…`}
+              </p>
+            </div>
+          </div>
+
+          {/* Divider */}
+          <div style={{ marginLeft: 10, borderLeft: "2px solid var(--ink-soft)", height: 10 }} />
+
+          {/* Step 2: Index */}
+          <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+            {step === 2 ? (
+              <svg width="20" height="20" viewBox="0 0 20 20" style={{ flexShrink: 0, animation: "ll-spin 0.9s linear infinite" }} aria-hidden="true">
+                <circle cx="10" cy="10" r="8" fill="none" stroke="var(--ink-soft)" strokeWidth="2.5" />
+                <path d="M10 2 A8 8 0 0 1 18 10" fill="none" stroke="var(--action)" strokeWidth="2.5" strokeLinecap="round" />
+              </svg>
+            ) : (
+              <span aria-hidden="true" style={{ width: 20, height: 20, borderRadius: "50%", border: "2px solid var(--ink-soft)", flexShrink: 0 }} />
+            )}
+            <div>
+              <p style={{ fontSize: 14, fontFamily: "var(--font-sans)", color: step === 2 ? "var(--ink)" : "var(--ink-muted)", fontWeight: step === 2 ? 500 : 400 }}>
+                {step === 2 ? "Indexing document passages…" : "Index document passages"}
+              </p>
+              {step === 2 && (
+                <p style={{ fontSize: 12, color: "var(--ink-muted)", marginTop: 3, fontFamily: "var(--font-sans)" }}>
+                  Embedding chunks for RAG search — almost done
+                </p>
+              )}
+            </div>
           </div>
         </div>
       )}
@@ -253,7 +285,7 @@ export default function LessonUpload({ teacherId, onUploaded, onCancel }: Props)
           disabled={files.length === 0 || !title.trim() || uploading}
         >
           {uploading
-            ? step === 2 ? "Indexing content…" : "Uploading…"
+            ? "Uploading…"
             : `Upload lesson${files.length > 1 ? ` (${files.length} files)` : ""}`}
         </button>
         {onCancel && !uploading && (

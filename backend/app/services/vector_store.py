@@ -1,27 +1,42 @@
 """
 PDF ingestion and pgvector similarity search.
 
-ingest_lesson  — parse a PDF, chunk by paragraph, embed, store LessonChunks
+ingest_lesson  — parse a document, chunk with 500/50 token splits, embed, store LessonChunks
 search         — embed a query, return top-k chunk texts
 """
 from __future__ import annotations
 
-import re
 from io import BytesIO
 
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pypdf import PdfReader
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.domain import LessonChunk
-from app.services.ollama_client import embed
+from app.services.ollama_client import embed, embed_batch
 
-# Chunks smaller than this (chars) are skipped — avoids noise from page numbers etc.
+# Chunks smaller than this (chars) are filtered after splitting — avoids noise
 MIN_CHUNK_CHARS = 80
-# Target chunk size in characters (soft limit — splits on paragraph boundaries)
-TARGET_CHUNK_CHARS = 800
+
+# 500-token chunks with 50-token overlap using the GPT-2 tokenizer
+# (closest public approximation to nomic-embed-text's vocabulary size)
+_splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
+    encoding_name="gpt2",
+    chunk_size=500,
+    chunk_overlap=50,
+)
 
 ACCEPTED_EXTENSIONS = {".pdf", ".docx", ".pptx", ".txt"}
+
+
+# ---------------------------------------------------------------------------
+# Text sanitization — remove invalid UTF-8 characters
+# ---------------------------------------------------------------------------
+
+def _sanitize_text(text: str) -> str:
+    """Remove null bytes and other problematic characters that break UTF-8 encoding."""
+    return "".join(char if ord(char) >= 32 or char in "\n\r\t" else " " for char in text)
 
 
 # ---------------------------------------------------------------------------
@@ -34,6 +49,7 @@ def _extract_pdf(data: bytes) -> str:
     for page in reader.pages:
         text = page.extract_text()
         if text:
+            text = _sanitize_text(text)
             pages.append(text)
     return "\n\n".join(pages)
 
@@ -41,7 +57,7 @@ def _extract_pdf(data: bytes) -> str:
 def _extract_docx(data: bytes) -> str:
     from docx import Document  # python-docx
     doc = Document(BytesIO(data))
-    paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
+    paragraphs = [_sanitize_text(p.text) for p in doc.paragraphs if p.text.strip()]
     return "\n\n".join(paragraphs)
 
 
@@ -54,7 +70,7 @@ def _extract_pptx(data: bytes) -> str:
         for shape in slide.shapes:
             if shape.has_text_frame:
                 for para in shape.text_frame.paragraphs:
-                    line = para.text.strip()
+                    line = _sanitize_text(para.text.strip())
                     if line:
                         texts.append(line)
         if texts:
@@ -63,7 +79,8 @@ def _extract_pptx(data: bytes) -> str:
 
 
 def _extract_txt(data: bytes) -> str:
-    return data.decode("utf-8", errors="replace")
+    text = data.decode("utf-8", errors="replace")
+    return _sanitize_text(text)
 
 
 def extract_text(file_bytes: bytes, filename: str) -> str:
@@ -92,50 +109,12 @@ def extract_text(file_bytes: bytes, filename: str) -> str:
 
 def _chunk_text(text: str) -> list[str]:
     """
-    Split *text* into chunks no larger than TARGET_CHUNK_CHARS.
-    Splits preferably at double-newlines (paragraph boundaries) then
-    at sentence endings if a paragraph is too long.
+    Split *text* into 500-token chunks with 50-token overlap.
+    Uses RecursiveCharacterTextSplitter with the GPT-2 tiktoken encoder.
+    Chunks shorter than MIN_CHUNK_CHARS chars are discarded (page numbers, etc.).
     """
-    # Normalise whitespace
-    text = re.sub(r"\r\n", "\n", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-
-    paragraphs = text.split("\n\n")
-    chunks: list[str] = []
-    buffer = ""
-
-    for para in paragraphs:
-        para = para.strip()
-        if not para:
-            continue
-
-        if len(buffer) + len(para) <= TARGET_CHUNK_CHARS:
-            buffer = (buffer + "\n\n" + para).strip()
-        else:
-            if buffer:
-                chunks.append(buffer)
-            # Para itself may exceed target — split at sentence boundaries
-            if len(para) > TARGET_CHUNK_CHARS:
-                sentences = re.split(r"(?<=[.!?])\s+", para)
-                sub_buf = ""
-                for sent in sentences:
-                    if len(sub_buf) + len(sent) <= TARGET_CHUNK_CHARS:
-                        sub_buf = (sub_buf + " " + sent).strip()
-                    else:
-                        if sub_buf:
-                            chunks.append(sub_buf)
-                        sub_buf = sent
-                if sub_buf:
-                    buffer = sub_buf
-                else:
-                    buffer = ""
-            else:
-                buffer = para
-
-    if buffer:
-        chunks.append(buffer)
-
-    return [c for c in chunks if len(c) >= MIN_CHUNK_CHARS]
+    raw_chunks = _splitter.split_text(text)
+    return [c for c in raw_chunks if len(c.strip()) >= MIN_CHUNK_CHARS]
 
 
 # ---------------------------------------------------------------------------
@@ -151,14 +130,23 @@ async def ingest_lesson(
     """
     Parse *file_bytes* (PDF, DOCX, PPTX, or TXT), embed each chunk,
     and store into lesson_chunks. Returns the number of chunks stored.
+
+    All chunk embeddings are requested in a single batched call to Ollama,
+    so upload time is one HTTP round-trip regardless of document length.
     """
     text = extract_text(file_bytes, filename)
     chunks = _chunk_text(text)
 
-    for chunk_text in chunks:
-        vector = await embed(chunk_text)
+    if not chunks:
+        return 0
+
+    # One batched embed call instead of N sequential calls
+    vectors = await embed_batch(chunks)
+
+    for i, (chunk_text, vector) in enumerate(zip(chunks, vectors)):
         db.add(LessonChunk(
             lesson_id=lesson_id,
+            chunk_index=i,
             content=chunk_text,
             embedding=vector,
         ))

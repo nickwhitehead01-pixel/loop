@@ -21,41 +21,43 @@ services:
       retries: 5
 
   # ── Ollama (local LLM server) ──────────────────────────────────────
-  ollama:
-    image: ollama/ollama:latest
-    container_name: gemma_edu_ollama
-    restart: unless-stopped
-    ports:
-      - "11434:11434"
-    volumes:
-      - ollama_data:/root/.ollama
-    healthcheck:
-      test: ["CMD", "ollama", "list"]
-      interval: 15s
-      timeout: 10s
-      retries: 10
-      start_period: 30s
+  # DISABLED FOR DEVELOPMENT: Run Ollama on your host machine instead
+  # Uncomment these services if deploying with Docker
+  # ollama:
+  #   image: ollama/ollama:latest
+  #   container_name: gemma_edu_ollama
+  #   restart: unless-stopped
+  #   ports:
+  #     - "11434:11434"
+  #   volumes:
+  #     - ollama_data:/root/.ollama
+  #   healthcheck:
+  #     test: ["CMD", "ollama", "list"]
+  #     interval: 15s
+  #     timeout: 10s
+  #     retries: 10
+  #     start_period: 30s
 
-  # ── Model puller: pulls all required models then exits ─────────────
-  # Runs once on first `docker-compose up`. Skipped on subsequent
-  # runs because the models are persisted in the ollama_data volume.
-  ollama-pull:
-    image: ollama/ollama:latest
-    container_name: gemma_edu_ollama_pull
-    depends_on:
-      ollama:
-        condition: service_healthy
-    environment:
-      - OLLAMA_HOST=http://ollama:11434
-    entrypoint: >
-      /bin/sh -c "
-        echo '>>> Pulling gemma4:e2b (Pupil + Teacher Agent)...' &&
-        ollama pull gemma4:e2b &&
-        echo '>>> Pulling nomic-embed-text (Embeddings)...' &&
-        ollama pull nomic-embed-text &&
-        echo '>>> All models ready.'
-      "
-    restart: "no"
+  # # ── Model puller: pulls all required models then exits ─────────────
+  # # Runs once on first `docker-compose up`. Skipped on subsequent
+  # # runs because the models are persisted in the ollama_data volume.
+  # ollama-pull:
+  #   image: ollama/ollama:latest
+  #   container_name: gemma_edu_ollama_pull
+  #   depends_on:
+  #     ollama:
+  #       condition: service_healthy
+  #   environment:
+  #     - OLLAMA_HOST=http://ollama:11434
+  #   entrypoint: >
+  #     /bin/sh -c "
+  #       echo '>>> Pulling gemma4:e2b (Pupil + Teacher Agent)...' &&
+  #       ollama pull gemma4:e2b &&
+  #       echo '>>> Pulling nomic-embed-text (Embeddings)...' &&
+  #       ollama pull nomic-embed-text &&
+  #       echo '>>> All models ready.'
+  #     "
+  #   restart: "no"
 
   # ── FastAPI backend ────────────────────────────────────────────────
   backend:

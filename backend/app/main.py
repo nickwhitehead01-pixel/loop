@@ -15,6 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.core.config import settings
 from app.core.database import Base, engine, AsyncSessionLocal
 from app.services import ollama_client
+from app.services.lesson_summary_worker import start_summary_worker
 from app.services.transcription import get_model
 
 logger = logging.getLogger(__name__)
@@ -50,6 +51,16 @@ async def lifespan(app: FastAPI):
         await conn.run_sync(Base.metadata.create_all)
     logger.info("Database tables created / verified")
 
+    # Add chunk_index column to lesson_chunks if it was created before this migration
+    async with engine.begin() as conn:
+        await conn.execute(
+            __import__("sqlalchemy", fromlist=["text"]).text(
+                "ALTER TABLE lesson_chunks "
+                "ADD COLUMN IF NOT EXISTS chunk_index INTEGER NOT NULL DEFAULT 0;"
+            )
+        )
+    logger.info("lesson_chunks.chunk_index column ensured")
+
     # Seed default users (auth is deferred — v1 uses fixed IDs)
     await _seed_default_users()
 
@@ -67,9 +78,18 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.exception("Whisper warm-up failed; live transcription may have cold-start delay")
 
+    # Start background lesson summary worker
+    summary_task = asyncio.create_task(start_summary_worker())
+    logger.info("Lesson summary worker task started")
+
     yield
 
     # Shutdown
+    summary_task.cancel()
+    try:
+        await summary_task
+    except asyncio.CancelledError:
+        pass
     await ollama_client.close_client()
     await engine.dispose()
     logger.info("Shutdown complete")
