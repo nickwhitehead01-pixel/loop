@@ -85,13 +85,13 @@ The teacher runs a **native iOS/iPadOS app** on their school iPad. They are neve
   This means every student's LangGraph agent has the teacher's words in its RAG context **within seconds** — students can ask questions about what was just said, even mid-lesson.
 
 ### 3. The Pupil Client (Edge Nodes)
-Each student's iPad runs a **native iOS/iPadOS app** distributed silently via MDM (Apple School Manager / Jamf). When opened, it uses **mDNS (Bonjour/ZeroConf)** to auto-discover the Windows Hub — no manual IP addresses required.
+Each student runs a **cross-platform pupil app (iPad + Android, including Google Pixel)**. The app first attempts local auto-discovery of the Windows Hub (Bonjour on Apple devices, NSD on Android), with a manual Hub URL fallback so both platforms can always connect on school Wi-Fi.
 
 Each student logs into their **own personalised LangGraph agent** backed by:
 - **Short-term memory:** sliding window of recent conversation messages
 - **Long-term memory:** atomic learning facts (struggles, preferences, progress) stored as pgvector embeddings, retrieved by similarity each turn
 - **RAG context:** live teacher transcript chunks (streamed in real-time as the teacher speaks) + uploaded lesson materials
-- **Apple accessibility:** on-device Text-to-Speech and Guided Access for neurodivergent learners
+- **Accessibility:** on-device Text-to-Speech and simplified, low-cognitive-load UX for neurodivergent learners
 
 ### 4. The Infrastructure (Air-Gap)
 All communication is **entirely on the school's local Wi-Fi**. The system is air-gapped from the internet by design, inherently complying with FERPA, GDPR, and IEP data privacy regulations.
