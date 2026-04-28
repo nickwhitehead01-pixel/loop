@@ -17,6 +17,7 @@ env/
 
 # Uploads / data
 backend/uploads/
+uploads/
 *.pdf
 
 # Docker volumes (not committed)
