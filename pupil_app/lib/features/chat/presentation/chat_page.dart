@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 
@@ -24,6 +25,34 @@ class _ChatPageState extends State<ChatPage> {
   StreamSubscription<ChatStreamFrame>? _subscription;
   int? _activeAssistantIndex;
   bool _connected = false;
+  bool _reconnecting = false;
+
+  String _friendlyConnectionError(Object error) {
+    if (error is TimeoutException) {
+      return 'Connection timed out. Check that the backend is running.';
+    }
+
+    if (error is SocketException) {
+      final String lower = error.toString().toLowerCase();
+      if (lower.contains('connection refused')) {
+        return 'Connection refused. Backend is likely not running.';
+      }
+      return 'Could not reach Hub. Check network and Hub URL.';
+    }
+
+    final String lower = error.toString().toLowerCase();
+    if (lower.contains('timed out')) {
+      return 'Connection timed out. Check that the backend is running.';
+    }
+    if (lower.contains('connection refused')) {
+      return 'Connection refused. Backend is likely not running.';
+    }
+    if (lower.contains('failed host lookup') || lower.contains('no address associated')) {
+      return 'Could not resolve Hub address. Check the Hub URL.';
+    }
+
+    return 'Could not connect to Hub. Please verify settings and retry.';
+  }
 
   @override
   void initState() {
@@ -65,9 +94,18 @@ class _ChatPageState extends State<ChatPage> {
         if (!mounted) {
           return;
         }
+        final String friendly = _friendlyConnectionError(error);
         setState(() {
           _connected = false;
-          _messages.add(ChatMessage(role: MessageRole.system, text: 'Connection error: $error'));
+          if (_activeAssistantIndex != null) {
+            final int index = _activeAssistantIndex!;
+            final ChatMessage current = _messages[index];
+            if (current.text.isEmpty) {
+              _messages[index] = current.copyWith(text: friendly);
+            }
+            _activeAssistantIndex = null;
+          }
+          _messages.add(ChatMessage(role: MessageRole.system, text: friendly));
         });
       },
       onDone: () {
@@ -80,6 +118,26 @@ class _ChatPageState extends State<ChatPage> {
       },
       cancelOnError: false,
     );
+  }
+
+  Future<void> _retryConnect() async {
+    if (_reconnecting) {
+      return;
+    }
+
+    setState(() {
+      _reconnecting = true;
+    });
+
+    await _connect();
+
+    if (!mounted) {
+      return;
+    }
+
+    setState(() {
+      _reconnecting = false;
+    });
   }
 
   Future<void> _send() async {
@@ -134,7 +192,25 @@ class _ChatPageState extends State<ChatPage> {
               width: double.infinity,
               padding: const EdgeInsets.all(12),
               color: _connected ? Colors.green.shade50 : Colors.orange.shade50,
-              child: Text(_connected ? 'Connected to Hub' : 'Disconnected - reconnect on send'),
+              child: Row(
+                children: <Widget>[
+                  Expanded(
+                    child: Text(_connected ? 'Connected to Hub' : 'Disconnected - reconnect on send'),
+                  ),
+                  if (!_connected)
+                    TextButton.icon(
+                      onPressed: _reconnecting ? null : _retryConnect,
+                      icon: _reconnecting
+                          ? const SizedBox(
+                              width: 14,
+                              height: 14,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            )
+                          : const Icon(Icons.refresh),
+                      label: Text(_reconnecting ? 'Retrying...' : 'Retry connection'),
+                    ),
+                ],
+              ),
             ),
             Expanded(
               child: ListView.builder(

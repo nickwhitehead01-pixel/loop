@@ -6,7 +6,7 @@ Uri wsUriForPupilChat(Uri hubUri, int pupilId) {
     scheme: wsScheme,
     host: hubUri.host,
     port: port,
-    path: '/ws/pupil/$pupilId/chat',
+    path: '/pupil/ws/$pupilId/chat',
   );
 }
 

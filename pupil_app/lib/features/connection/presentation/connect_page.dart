@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart';
 
 import '../../../core/models/hub_settings.dart';
 import '../../chat/presentation/chat_page.dart';
@@ -14,13 +15,21 @@ class ConnectPage extends StatefulWidget {
 
 class _ConnectPageState extends State<ConnectPage> {
   final GlobalKey<FormState> _formKey = GlobalKey<FormState>();
-  final TextEditingController _hubUrlController = TextEditingController(text: 'http://192.168.1.10:8000');
+  final TextEditingController _hubUrlController = TextEditingController(text: _defaultHubUrl());
   final TextEditingController _pupilIdController = TextEditingController(text: '1');
   final HubConnectionRepository _connectionRepo = const HubConnectionRepository();
   final HubSettingsStore _store = HubSettingsStore();
 
   bool _testing = false;
   bool _saving = false;
+
+  static String _defaultHubUrl() {
+    if (!kIsWeb && defaultTargetPlatform == TargetPlatform.android) {
+      // Android emulators use 10.0.2.2 to reach services running on the host machine.
+      return 'http://10.0.2.2:8000';
+    }
+    return 'http://192.168.50.60:8000';
+  }
 
   @override
   void dispose() {
@@ -39,7 +48,7 @@ class _ConnectPageState extends State<ConnectPage> {
     });
 
     final Uri hubUri = Uri.parse(_hubUrlController.text.trim());
-    final bool ok = await _connectionRepo.testHealth(hubUri);
+    final HubHealthCheckResult result = await _connectionRepo.testHealth(hubUri);
 
     if (!mounted) {
       return;
@@ -50,7 +59,7 @@ class _ConnectPageState extends State<ConnectPage> {
     });
 
     ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text(ok ? 'Hub is reachable.' : 'Could not reach Hub /health endpoint.')),
+      SnackBar(content: Text(result.userMessage)),
     );
   }
 
@@ -67,6 +76,22 @@ class _ConnectPageState extends State<ConnectPage> {
       hubUri: Uri.parse(_hubUrlController.text.trim()),
       pupilId: int.parse(_pupilIdController.text.trim()),
     );
+
+    final HubHealthCheckResult result = await _connectionRepo.testHealth(settings.hubUri);
+
+    if (!mounted) {
+      return;
+    }
+
+    if (!result.isReachable) {
+      setState(() {
+        _saving = false;
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(result.userMessage)),
+      );
+      return;
+    }
 
     await _store.save(settings);
 
@@ -141,7 +166,7 @@ class _ConnectPageState extends State<ConnectPage> {
                 const SizedBox(height: 8),
                 FilledButton(
                   onPressed: _saving ? null : _saveAndContinue,
-                  child: Text(_saving ? 'Saving...' : 'Continue to Chat'),
+                  child: Text(_saving ? 'Connecting...' : 'Continue to Chat'),
                 ),
               ],
             ),

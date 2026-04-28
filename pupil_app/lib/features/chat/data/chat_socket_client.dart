@@ -10,15 +10,16 @@ class ChatSocketClient {
 
   Stream<ChatStreamFrame> connect(Uri hubUri, int pupilId) {
     final Uri socketUri = wsUriForPupilChat(hubUri, pupilId);
-    _channel = IOWebSocketChannel.connect(socketUri);
+    _channel = IOWebSocketChannel.connect(
+      socketUri,
+      connectTimeout: const Duration(seconds: 3),
+    );
 
     return _channel!.stream.map((dynamic data) {
       final dynamic payload = jsonDecode(data as String);
       final String token = (payload['token'] ?? '').toString();
       final bool done = payload['done'] == true;
       return ChatStreamFrame(token: token, done: done);
-    }).handleError((Object error) {
-      return ChatStreamFrame(token: '', done: true, error: error.toString());
     });
   }
 
