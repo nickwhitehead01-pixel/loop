@@ -44,22 +44,9 @@ logger = logging.getLogger(__name__)
 # Base system prompt
 # ---------------------------------------------------------------------------
 
-_BASE_SYSTEM = """You are a warm, collaborative Teaching Assistant helping a teacher manage their classroom. You are a peer and a sounding board.
-
-You have access to tools to:
-- get_lesson_summaries: retrieve AI-analysed summaries of uploaded lesson materials (pass lesson_title to search, or leave empty to list all)
-- search_lesson_content: search uploaded lesson materials for detailed content
-- get_class_analytics: get aggregated pupil performance metrics (optionally by session_id)
-- get_student_profile: get an individual pupil's progress and summaries
-- get_teacher_memories: recall facts about this teacher and class from previous sessions
-- search_transcript: search past lesson transcripts by topic (optionally by session_id)
-
-Core Directives:
-1. Use Tools Proactively: When the teacher asks about lessons, student progress, class analytics, or transcripts, use the appropriate tool immediately. These tools provide current, accurate data.
-2. Synthesize, Don't Dump: When you use a tool, don't just read the data back like a robot. Weave it into your conversation naturally.
-3. Be Conversational: Be warm, supportive, and collaborative. Ask clarifying questions if needed, offer insights, and suggest next steps based on data you retrieve.
-4. Respect Privacy: When discussing pupil data, summarise trends rather than exposing raw messages.
-"""
+_BASE_SYSTEM = """You are a warm, collaborative Teaching Assistant helping a teacher manage their classroom.
+Relevant data is provided in the [DATA] block below — use it to give accurate, grounded answers.
+Be conversational, synthesise insights, and respect pupil privacy by summarising rather than quoting raw data."""
 
 
 def _build_system_prompt(memories: list[str]) -> str:
@@ -127,13 +114,17 @@ async def get_class_analytics_impl(db: AsyncSession) -> str:
 # Public entry point — called by the WebSocket endpoint
 # ---------------------------------------------------------------------------
 
-# Tool invocation keywords for direct dispatch
+# Tool invocation keywords — DB-only tools listed FIRST to avoid blocking embed calls.
+# Embed-dependent tools (search_lesson_content, get_teacher_memories, search_transcript)
+# only fire if no DB tool matched, keeping Ollama free to start the LLM sooner.
 TOOL_KEYWORDS = {
-    "get_lesson_summaries": ["lesson", "summary", "material", "upload", "cover", "content", "taught", "covered"],
-    "search_lesson_content": ["search", "find", "look for", "example", "specific", "contain"],
-    "get_class_analytics": ["analytics", "performance", "progress", "score", "understanding", "questions"],
-    "get_student_profile": ["student", "pupil", "progress", "profile", "performance"],
-    "get_teacher_memories": ["remember", "recall", "memory", "know about", "class"],
+    # --- DB-only (no embed, instant) ---
+    "get_lesson_summaries": ["lesson", "summary", "material", "upload", "taught", "covered", "available"],
+    "get_class_analytics": ["analytics", "performance", "class score", "understanding", "questions asked"],
+    "get_student_profile": ["student", "pupil", "profile"],
+    # --- Embed-dependent (queues on Ollama GPU — only reached if above didn't match) ---
+    "search_lesson_content": ["search", "find", "look for", "example", "specific", "contain", "content"],
+    "get_teacher_memories": ["remember", "recall", "memory", "know about"],
     "search_transcript": ["transcript", "said", "spoken", "audio", "recording"],
 }
 
@@ -293,39 +284,38 @@ async def run_teacher_agent(
     ))
     await db.flush()
 
-    # Load long-term teacher memories (most recent first, capped at 5)
-    mem_result = await db.execute(
-        select(TeacherMemory.memory)
-        .where(TeacherMemory.teacher_id == teacher_id)
-        .order_by(TeacherMemory.created_at.desc())
-        .limit(5)
+    # Fetch memories and history in parallel — both are independent DB reads
+    mem_result, hist_result = await asyncio.gather(
+        db.execute(
+            select(TeacherMemory.memory)
+            .where(TeacherMemory.teacher_id == teacher_id)
+            .order_by(TeacherMemory.created_at.desc())
+            .limit(5)
+        ),
+        db.execute(
+            select(TeacherMessage)
+            .where(TeacherMessage.conversation_id == conversation_id)
+            .order_by(TeacherMessage.created_at.desc())
+            .limit(settings.memory_window)
+        ),
     )
     prior_memories = list(mem_result.scalars().all())
+    history = list(reversed(hist_result.scalars().all()))
 
     # Try to detect and invoke appropriate tool
     tool_result = await _detect_and_invoke_tool(user_message, db, teacher_id)
 
-    # Build system prompt with tool results if available
+    # Build system prompt
     system_lines = [_BASE_SYSTEM]
     if prior_memories:
         block = "\n".join(f"- {m}" for m in prior_memories)
-        system_lines.append(f"\nWhat you know about this teacher and class:\n{block}\n")
-
+        system_lines.append(f"\nWhat you know about this teacher and class:\n{block}")
     if tool_result:
-        system_lines.append(f"\n[DATA RETRIEVED FROM TOOLS]:\n{tool_result}\n")
+        system_lines.append(f"\n[DATA]\n{tool_result}")
+    system_prompt = "\n".join(system_lines)
 
-    system_prompt = "".join(system_lines)
-
-    # Load recent conversation history
-    hist_result = await db.execute(
-        select(TeacherMessage)
-        .where(TeacherMessage.conversation_id == conversation_id)
-        .order_by(TeacherMessage.created_at.desc())
-        .limit(settings.memory_window)
-    )
-    history = list(reversed(hist_result.scalars().all()))
-    # Exclude the message we just inserted, then cap to last 10 messages
-    recent = history[:-1][-10:]
+    # Cap to last 6 messages (3 turns) — matches pupil agent, prevents prompt bloat
+    recent = history[:-1][-6:]
     lc_messages: list[BaseMessage] = [SystemMessage(content=system_prompt)]
     for m in recent:
         cls = HumanMessage if m.role == MessageRole.user else AIMessage

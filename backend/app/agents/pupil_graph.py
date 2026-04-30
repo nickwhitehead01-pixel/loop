@@ -34,20 +34,19 @@ from typing import AsyncIterator
 import httpx
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langchain_ollama import ChatOllama
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agents.tools import (
+    _embed as _embed_fn,
     get_conversation_history_func,
     get_full_transcript_func,
-    get_pupil_memories_func,
     list_lessons_func,
-    retrieve_context_func,
     save_pupil_memories_func,
-    search_live_transcript_func,
 )
 from app.core.config import settings
 from app.core.database import AsyncSessionLocal
-from app.models.domain import Message, MessageRole
+from app.models.domain import LessonChunk, Message, MessageRole, PupilMemory, TranscriptChunk
 from app.services import ollama_client
 from app.services import semantic_cache as _sem_cache
 
@@ -172,23 +171,47 @@ async def run_pupil_agent(
         yield _cached
         return
 
-    # --- Retrieve: memories (similarity, k=3) + one context block ---
+    # --- Embed once, share vector across memory + context retrieval ---
     tool_name = _dispatch_tool(user_message, session_id)
 
-    prior_memories = await get_pupil_memories_func(
-        query=user_message,
-        pupil_id=pupil_id,
-        db=db,
-        http_client=http_client,
-        k=3,
+    # Embed once — shared across memory similarity search and context retrieval
+    shared_vector: list[float] = await _embed_fn(user_message, http_client)
+
+    # Fetch memories (using shared vector) + history in parallel
+    mem_query = db.execute(
+        select(PupilMemory.memory)
+        .where(PupilMemory.pupil_id == pupil_id)
+        .order_by(PupilMemory.embedding.cosine_distance(shared_vector))
+        .limit(3)
     )
+    hist_query = get_conversation_history_func(conversation_id, db)
+    mem_result, history = await asyncio.gather(mem_query, hist_query)
+    prior_memories = list(mem_result.scalars().all())
 
     context = ""
     try:
         if tool_name == "retrieve_context":
-            context = await retrieve_context_func(user_message, db, http_client)
+            # Pass shared vector directly — no second embed call
+            rows = (await db.execute(
+                select(LessonChunk.content)
+                .order_by(LessonChunk.embedding.cosine_distance(shared_vector))
+                .limit(3)
+            )).scalars().all()
+            context = "\n\n---\n\n".join(rows) if rows else ""
         elif tool_name == "search_transcript":
-            context = await search_live_transcript_func(user_message, session_id, db, http_client)
+            # Pass shared vector directly — no second embed call
+            rows = (await db.execute(
+                select(TranscriptChunk.content, TranscriptChunk.timestamp_ms)
+                .where(TranscriptChunk.session_id == session_id)
+                .order_by(TranscriptChunk.embedding.cosine_distance(shared_vector))
+                .limit(3)
+            )).all()
+            if rows:
+                parts = []
+                for content, ts_ms in rows:
+                    mins, secs = divmod(ts_ms // 1000, 60)
+                    parts.append(f"[{mins:02d}:{secs:02d}] {content}")
+                context = "\n\n".join(parts)
         elif tool_name == "get_full_transcript":
             context = await get_full_transcript_func(session_id, db)
         elif tool_name == "list_lessons":
@@ -199,8 +222,7 @@ async def run_pupil_agent(
 
     system_prompt = _build_system_prompt(prior_memories, context)
 
-    # --- Build message list (short-term history capped at 6 messages / 3 turns) ---
-    history = await get_conversation_history_func(conversation_id, db)
+    # --- Build message list (history already fetched in gather above) ---
     recent = history[:-1][-6:]
     lc_messages: list[BaseMessage] = [SystemMessage(content=system_prompt)]
     for m in recent:
