@@ -20,6 +20,9 @@ backend/uploads/
 uploads/
 *.pdf
 
+# Local runtime data (SQLite + ChromaDB)
+backend/data/
+
 # Docker volumes (not committed)
 postgres_data/
 ollama_data/

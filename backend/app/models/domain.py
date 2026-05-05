@@ -3,7 +3,6 @@ from __future__ import annotations
 import enum
 from datetime import datetime
 
-from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
     Boolean,
     DateTime,
@@ -11,11 +10,11 @@ from sqlalchemy import (
     Float,
     ForeignKey,
     Integer,
+    JSON,
     String,
     Text,
     func,
 )
-from sqlalchemy.dialects.postgresql import JSON
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
@@ -116,7 +115,6 @@ class TranscriptChunk(Base):
         nullable=False, index=True,
     )
     content: Mapped[str] = mapped_column(Text, nullable=False)
-    embedding: Mapped[list[float]] = mapped_column(Vector(768), nullable=False)
     timestamp_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
@@ -183,8 +181,6 @@ class LessonChunk(Base):
     )
     chunk_index: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     content: Mapped[str] = mapped_column(Text, nullable=False)
-    # nomic-embed-text produces 768-dimensional vectors
-    embedding: Mapped[list[float]] = mapped_column(Vector(768), nullable=False)
 
     lesson: Mapped[Lesson] = relationship(back_populates="chunks")
 
@@ -249,8 +245,6 @@ class PupilMemory(Base):
         Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
     )
     memory: Mapped[str] = mapped_column(Text, nullable=False)
-    # Embedding of the memory text — used for similarity retrieval
-    embedding: Mapped[list[float]] = mapped_column(Vector(768), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -385,7 +379,6 @@ class TeacherMemory(Base):
         Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
     )
     memory: Mapped[str] = mapped_column(Text, nullable=False)
-    embedding: Mapped[list[float]] = mapped_column(Vector(768), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -411,7 +404,6 @@ class SemanticCache(Base):
         nullable=True, index=True,
     )
     question: Mapped[str] = mapped_column(Text, nullable=False)
-    embedding: Mapped[list[float]] = mapped_column(Vector(768), nullable=False)
     answer: Mapped[str] = mapped_column(Text, nullable=False)
     hit_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     created_at: Mapped[datetime] = mapped_column(

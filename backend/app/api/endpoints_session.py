@@ -30,6 +30,7 @@ from app.models.schemas import (
     TranscriptChunkResponse,
 )
 from app.services import ollama_client
+from app.services.chroma_client import transcript_chunks_col
 from app.services.transcription import transcribe_chunk
 
 logger = logging.getLogger(__name__)
@@ -106,29 +107,32 @@ async def audio_stream(
     logger.info("Teacher audio stream connected for session %d", session_id)
 
     # ------------------------------------------------------------------
-    # Bucket state — accumulates small VAD utterances before embedding.
-    # The frontend VAD (and live captions) are completely unaffected; we
-    # still ACK every utterance immediately.  Only the embed + DB write
-    # is deferred until the bucket is large enough to be useful for RAG.
+    # Bucket state — accumulates utterances before embedding for ChromaDB.
+    # SQLite receives each utterance immediately so the pupil agent can
+    # query it in real-time without waiting for the bucket to fill.
     # ------------------------------------------------------------------
     bucket_utterances: list[str] = []
     bucket_start_ms: int | None = None   # timestamp_ms of first utterance
     bucket_opened_at: float = time.time()
 
     async def flush_bucket() -> None:
+        """Embed the accumulated bucket and write to ChromaDB only."""
         nonlocal bucket_utterances, bucket_start_ms, bucket_opened_at
         if not bucket_utterances:
             return
+        import uuid as _uuid
         joined = " ".join(bucket_utterances)
         vector = await ollama_client.embed(joined)
-        db.add(TranscriptChunk(
-            session_id=session_id,
-            content=joined,
-            embedding=vector,
-            timestamp_ms=bucket_start_ms or 0,
-        ))
-        await db.flush()
-        await db.commit()
+        # Store embedding in ChromaDB (SQLite write already happened per-utterance)
+        transcript_chunks_col().add(
+            ids=[str(_uuid.uuid4())],
+            embeddings=[vector],
+            documents=[joined],
+            metadatas=[{
+                "session_id": str(session_id),
+                "timestamp_ms": str(bucket_start_ms or 0),
+            }],
+        )
         logger.debug(
             "Flushed transcript bucket for session %d: %d utterances / %d words",
             session_id, len(bucket_utterances),
@@ -156,6 +160,16 @@ async def audio_stream(
                 continue
 
             timestamp_ms = int((time.time() - session_start) * 1000)
+
+            # ── Immediate SQLite write — no embedding, no bucket wait ───
+            # This ensures the pupil agent can query the transcript in
+            # real-time even before the ChromaDB bucket is flushed.
+            db.add(TranscriptChunk(
+                session_id=session_id,
+                content=result.text,
+                timestamp_ms=timestamp_ms,
+            ))
+            await db.commit()
 
             # ── Live caption path (unchanged) ──────────────────────────
             # Acknowledge to teacher immediately so captions stay snappy.

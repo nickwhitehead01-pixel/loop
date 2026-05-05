@@ -49,6 +49,7 @@ from app.core.database import AsyncSessionLocal
 from app.models.domain import LessonChunk, Message, MessageRole, PupilMemory, TranscriptChunk
 from app.services import ollama_client
 from app.services import semantic_cache as _sem_cache
+from app.services.chroma_client import lesson_chunks_col, pupil_memories_col, transcript_chunks_col
 
 logger = logging.getLogger(__name__)
 
@@ -60,18 +61,35 @@ logger = logging.getLogger(__name__)
 _TRANSCRIPT_KEYWORDS = {"transcript", "said", "spoken", "recap", "everything", "audio", "recording"}
 _FULL_RECAP_KEYWORDS  = {"full recap", "entire lesson", "whole lesson", "everything said"}
 _LIST_KEYWORDS        = {"what lessons", "which lessons", "available lessons", "topics available", "list lessons"}
+# Live keywords: route to get_full_transcript (SQLite, always current) so
+# the pupil can ask about speech that hasn't yet been flushed to ChromaDB.
+_LIVE_KEYWORDS        = {"just said", "just now", "right now", "currently", "latest", "just mentioned"}
 
 
 def _dispatch_tool(user_message: str, session_id: int | None) -> str:
-    """Return the name of the single retrieval tool to invoke this turn."""
+    """Return the name of the single retrieval tool to invoke this turn.
+
+    Transcript tools only activate when session_id is present.
+    Without a session_id, transcript keyword queries fall through to
+    retrieve_context so the agent searches lesson chunks — which includes
+    any transcript files the teacher uploaded alongside lesson materials.
+    """
     msg = user_message.lower()
     if session_id:
+        # Live/recency queries — must check before _TRANSCRIPT_KEYWORDS
+        if any(phrase in msg for phrase in _LIVE_KEYWORDS):
+            logger.info("Dispatch → get_full_transcript (live keyword, session=%d)", session_id)
+            return "get_full_transcript"
         if any(phrase in msg for phrase in _FULL_RECAP_KEYWORDS):
+            logger.info("Dispatch → get_full_transcript (full recap, session=%d)", session_id)
             return "get_full_transcript"
         if any(kw in msg for kw in _TRANSCRIPT_KEYWORDS):
+            logger.info("Dispatch → search_transcript (transcript keyword, session=%d)", session_id)
             return "search_transcript"
     if any(phrase in msg for phrase in _LIST_KEYWORDS):
+        logger.info("Dispatch → list_lessons")
         return "list_lessons"
+    logger.info("Dispatch → retrieve_context (session_id=%s)", session_id)
     return "retrieve_context"
 
 
@@ -178,39 +196,51 @@ async def run_pupil_agent(
     shared_vector: list[float] = await _embed_fn(user_message, http_client)
 
     # Fetch memories (using shared vector) + history in parallel
-    mem_query = db.execute(
-        select(PupilMemory.memory)
-        .where(PupilMemory.pupil_id == pupil_id)
-        .order_by(PupilMemory.embedding.cosine_distance(shared_vector))
-        .limit(3)
+    def _query_memories():
+        col = pupil_memories_col()
+        results = col.query(
+            query_embeddings=[shared_vector],
+            n_results=3,
+            where={"pupil_id": str(pupil_id)},
+            include=["documents"],
+        )
+        return list((results.get("documents") or [[]])[0])
+
+    import asyncio as _asyncio
+    prior_memories, history = await _asyncio.gather(
+        asyncio.get_event_loop().run_in_executor(None, _query_memories),
+        get_conversation_history_func(conversation_id, db),
     )
-    hist_query = get_conversation_history_func(conversation_id, db)
-    mem_result, history = await asyncio.gather(mem_query, hist_query)
-    prior_memories = list(mem_result.scalars().all())
 
     context = ""
     try:
         if tool_name == "retrieve_context":
             # Pass shared vector directly — no second embed call
-            rows = (await db.execute(
-                select(LessonChunk.content)
-                .order_by(LessonChunk.embedding.cosine_distance(shared_vector))
-                .limit(3)
-            )).scalars().all()
+            col = lesson_chunks_col()
+            results = col.query(
+                query_embeddings=[shared_vector],
+                n_results=3,
+                include=["documents"],
+            )
+            rows = (results.get("documents") or [[]])[0]
             context = "\n\n---\n\n".join(rows) if rows else ""
         elif tool_name == "search_transcript":
             # Pass shared vector directly — no second embed call
-            rows = (await db.execute(
-                select(TranscriptChunk.content, TranscriptChunk.timestamp_ms)
-                .where(TranscriptChunk.session_id == session_id)
-                .order_by(TranscriptChunk.embedding.cosine_distance(shared_vector))
-                .limit(3)
-            )).all()
-            if rows:
+            col = transcript_chunks_col()
+            results = col.query(
+                query_embeddings=[shared_vector],
+                n_results=3,
+                where={"session_id": str(session_id)},
+                include=["documents", "metadatas"],
+            )
+            docs = (results.get("documents") or [[]])[0]
+            metas = (results.get("metadatas") or [[]])[0]
+            if docs:
                 parts = []
-                for content, ts_ms in rows:
+                for doc, meta in zip(docs, metas):
+                    ts_ms = int(meta.get("timestamp_ms", 0))
                     mins, secs = divmod(ts_ms // 1000, 60)
-                    parts.append(f"[{mins:02d}:{secs:02d}] {content}")
+                    parts.append(f"[{mins:02d}:{secs:02d}] {doc}")
                 context = "\n\n".join(parts)
         elif tool_name == "get_full_transcript":
             context = await get_full_transcript_func(session_id, db)

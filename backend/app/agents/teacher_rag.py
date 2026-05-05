@@ -4,7 +4,7 @@ Teacher RAG pipeline.
 Not a LangGraph graph — this is a sequential pipeline (no decision loop
 needed). It uses gemma4:e2b for reasoning on structured document analysis.
 
-process_lesson   — ingest document bytes into pgvector (500/50 token chunks)
+process_lesson   — ingest document bytes into ChromaDB (500/50 token chunks)
 summarise_lesson — iterate chunks → gemma4:e2b 2-sentence summary per chunk
                    → concatenate → return full lesson summary string
 """

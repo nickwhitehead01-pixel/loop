@@ -6,8 +6,8 @@ websockets==15.0.1
 
 # Database
 sqlalchemy[asyncio]==2.0.40
-asyncpg==0.30.0
-pgvector==0.4.0
+aiosqlite>=0.20.0
+chromadb>=0.6.0
 alembic==1.15.2
 
 # Configuration
