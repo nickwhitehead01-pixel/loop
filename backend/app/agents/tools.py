@@ -42,7 +42,7 @@ async def retrieve_context_func(
     query: str,
     db: AsyncSession,
     http_client,
-    k: int = 5,
+    k: int = 3,
 ) -> str:
     """Embed *query* and return the top-k lesson chunk texts joined by newlines."""
     vector = await _embed(query, http_client)
@@ -160,7 +160,7 @@ async def search_live_transcript_func(
     session_id: int,
     db: AsyncSession,
     http_client,
-    k: int = 5,
+    k: int = 3,
 ) -> str:
     """
     Embed *query* and return the top-k transcript chunks for *session_id*
@@ -191,11 +191,12 @@ async def get_full_transcript_func(
     session_id: int,
     db: AsyncSession,
 ) -> str:
-    """Return the full ordered transcript for *session_id*."""
+    """Return the full ordered transcript for *session_id* (capped at 20 chunks)."""
     result = await db.execute(
         select(TranscriptChunk.content, TranscriptChunk.timestamp_ms)
         .where(TranscriptChunk.session_id == session_id)
         .order_by(TranscriptChunk.timestamp_ms)
+        .limit(20)
     )
     rows = result.all()
     if not rows:
