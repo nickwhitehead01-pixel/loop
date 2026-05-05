@@ -30,6 +30,7 @@ from app.models.schemas import (
     TranscriptChunkResponse,
 )
 from app.services import ollama_client
+from app.services.chroma_client import transcript_chunks_col
 from app.services.transcription import transcribe_chunk
 
 logger = logging.getLogger(__name__)
@@ -119,15 +120,27 @@ async def audio_stream(
         nonlocal bucket_utterances, bucket_start_ms, bucket_opened_at
         if not bucket_utterances:
             return
+        import uuid as _uuid
         joined = " ".join(bucket_utterances)
         vector = await ollama_client.embed(joined)
-        db.add(TranscriptChunk(
+        chunk = TranscriptChunk(
             session_id=session_id,
             content=joined,
-            embedding=vector,
             timestamp_ms=bucket_start_ms or 0,
-        ))
+        )
+        db.add(chunk)
         await db.flush()
+        # Store embedding in ChromaDB
+        transcript_chunks_col().add(
+            ids=[str(_uuid.uuid4())],
+            embeddings=[vector],
+            documents=[joined],
+            metadatas=[{
+                "session_id": str(session_id),
+                "timestamp_ms": str(bucket_start_ms or 0),
+                "sqlite_id": str(chunk.id),
+            }],
+        )
         await db.commit()
         logger.debug(
             "Flushed transcript bucket for session %d: %d utterances / %d words",

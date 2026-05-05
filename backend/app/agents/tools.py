@@ -21,10 +21,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.models.domain import Conversation, Lesson, LessonChunk, Message, PupilMemory, TranscriptChunk
+from app.services.chroma_client import lesson_chunks_col, pupil_memories_col, transcript_chunks_col
 
 
 # ---------------------------------------------------------------------------
-# Tool 1 — Retrieval (pgvector similarity search)
+# Tool 1 — Retrieval (ChromaDB similarity search)
 # ---------------------------------------------------------------------------
 
 async def _embed(text: str, http_client) -> list[float]:
@@ -46,13 +47,9 @@ async def retrieve_context_func(
 ) -> str:
     """Embed *query* and return the top-k lesson chunk texts joined by newlines."""
     vector = await _embed(query, http_client)
-    # pgvector cosine similarity — lower distance = more similar
-    result = await db.execute(
-        select(LessonChunk.content)
-        .order_by(LessonChunk.embedding.cosine_distance(vector))
-        .limit(k)
-    )
-    rows = result.scalars().all()
+    col = lesson_chunks_col()
+    results = col.query(query_embeddings=[vector], n_results=k, include=["documents"])
+    rows = (results.get("documents") or [[]])[0]
     if not rows:
         return "No relevant lesson content found."
     return "\n\n---\n\n".join(rows)
@@ -107,14 +104,14 @@ async def get_pupil_memories_func(
     Returns plain strings, e.g. ["struggles with quadratic equations"].
     """
     vector = await _embed(query, http_client)
-    result = await db.execute(
-        select(PupilMemory.memory)
-        .where(PupilMemory.pupil_id == pupil_id)
-        .order_by(PupilMemory.embedding.cosine_distance(vector))
-        .limit(k)
+    col = pupil_memories_col()
+    results = col.query(
+        query_embeddings=[vector],
+        n_results=k,
+        where={"pupil_id": str(pupil_id)},
+        include=["documents"],
     )
-    rows = result.scalars().all()
-    return list(rows)
+    return list((results.get("documents") or [[]])[0])
 
 
 async def load_all_pupil_memories_func(
@@ -141,14 +138,22 @@ async def save_pupil_memories_func(
     http_client,
 ) -> None:
     """Embed and persist a list of new memory strings for *pupil_id*."""
+    import uuid as _uuid
+    col = pupil_memories_col()
     for memory_text in memories:
         vector = await _embed(memory_text, http_client)
-        db.add(PupilMemory(
+        mem = PupilMemory(
             pupil_id=pupil_id,
             memory=memory_text,
-            embedding=vector,
-        ))
-    await db.flush()
+        )
+        db.add(mem)
+        await db.flush()
+        col.add(
+            ids=[str(_uuid.uuid4())],
+            embeddings=[vector],
+            documents=[memory_text],
+            metadatas=[{"pupil_id": str(pupil_id), "sqlite_id": str(mem.id)}],
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -167,19 +172,22 @@ async def search_live_transcript_func(
     that are most semantically similar.
     """
     vector = await _embed(query, http_client)
-    result = await db.execute(
-        select(TranscriptChunk.content, TranscriptChunk.timestamp_ms)
-        .where(TranscriptChunk.session_id == session_id)
-        .order_by(TranscriptChunk.embedding.cosine_distance(vector))
-        .limit(k)
+    col = transcript_chunks_col()
+    results = col.query(
+        query_embeddings=[vector],
+        n_results=k,
+        where={"session_id": str(session_id)},
+        include=["documents", "metadatas"],
     )
-    rows = result.all()
-    if not rows:
+    docs = (results.get("documents") or [[]])[0]
+    metas = (results.get("metadatas") or [[]])[0]
+    if not docs:
         return "No transcript content found for this session."
     parts = []
-    for content, ts_ms in rows:
+    for doc, meta in zip(docs, metas):
+        ts_ms = int(meta.get("timestamp_ms", 0))
         mins, secs = divmod(ts_ms // 1000, 60)
-        parts.append(f"[{mins:02d}:{secs:02d}] {content}")
+        parts.append(f"[{mins:02d}:{secs:02d}] {doc}")
     return "\n\n".join(parts)
 
 

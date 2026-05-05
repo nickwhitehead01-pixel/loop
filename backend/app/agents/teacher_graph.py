@@ -36,6 +36,7 @@ from app.models.domain import (
     User,
 )
 from app.services import ollama_client
+from app.services.chroma_client import lesson_chunks_col, teacher_memories_col, transcript_chunks_col
 
 logger = logging.getLogger(__name__)
 
@@ -83,12 +84,9 @@ async def get_lesson_summaries_impl(db: AsyncSession, teacher_id: int) -> str:
 async def search_lesson_content_impl(db: AsyncSession, user_message: str) -> str:
     """Search lesson content by semantic similarity."""
     vector = await ollama_client.embed(user_message)
-    result = await db.execute(
-        select(LessonChunk.content)
-        .order_by(LessonChunk.embedding.cosine_distance(vector))
-        .limit(5)
-    )
-    rows = result.scalars().all()
+    col = lesson_chunks_col()
+    results = col.query(query_embeddings=[vector], n_results=5, include=["documents"])
+    rows = (results.get("documents") or [[]])[0]
     return "\n\n---\n\n".join(rows) if rows else "No relevant lesson content found."
 
 
@@ -155,11 +153,19 @@ async def _extract_and_store_memories(teacher_id: int, user_message: str, assist
         async with AsyncSessionLocal() as mem_db:
             for mem_text in new_memories:
                 vector = await ollama_client.embed(mem_text)
-                mem_db.add(TeacherMemory(
+                import uuid as _uuid
+                mem = TeacherMemory(
                     teacher_id=teacher_id,
                     memory=mem_text,
-                    embedding=vector,
-                ))
+                )
+                mem_db.add(mem)
+                await mem_db.flush()
+                teacher_memories_col().add(
+                    ids=[str(_uuid.uuid4())],
+                    embeddings=[vector],
+                    documents=[mem_text],
+                    metadatas=[{"teacher_id": str(teacher_id), "sqlite_id": str(mem.id)}],
+                )
             await mem_db.commit()
     except Exception:
         pass  # memory extraction must never surface errors
@@ -196,12 +202,9 @@ async def _detect_and_invoke_tool(user_message: str, db: AsyncSession, teacher_i
 
                 elif tool_name == "search_lesson_content":
                     vector = await ollama_client.embed(user_message)
-                    result = await db.execute(
-                        select(LessonChunk.content)
-                        .order_by(LessonChunk.embedding.cosine_distance(vector))
-                        .limit(5)
-                    )
-                    rows = result.scalars().all()
+                    col = lesson_chunks_col()
+                    results = col.query(query_embeddings=[vector], n_results=5, include=["documents"])
+                    rows = (results.get("documents") or [[]])[0]
                     return "\n\n---\n\n".join(rows) if rows else "No relevant lesson content found."
 
                 elif tool_name == "get_class_analytics":
@@ -234,33 +237,34 @@ async def _detect_and_invoke_tool(user_message: str, db: AsyncSession, teacher_i
 
                 elif tool_name == "get_teacher_memories":
                     vector = await ollama_client.embed(user_message)
-                    result = await db.execute(
-                        select(TeacherMemory.memory)
-                        .where(TeacherMemory.teacher_id == teacher_id)
-                        .order_by(TeacherMemory.embedding.cosine_distance(vector))
-                        .limit(5)
+                    col = teacher_memories_col()
+                    results = col.query(
+                        query_embeddings=[vector],
+                        n_results=5,
+                        where={"teacher_id": str(teacher_id)},
+                        include=["documents"],
                     )
-                    rows = result.scalars().all()
+                    rows = (results.get("documents") or [[]])[0]
                     return "\n".join(f"- {m}" for m in rows) if rows else "No relevant memories found."
 
                 elif tool_name == "search_transcript":
                     vector = await ollama_client.embed(user_message)
-                    result = await db.execute(
-                        select(
-                            TranscriptChunk.content,
-                            TranscriptChunk.timestamp_ms,
-                            TranscriptChunk.session_id,
-                        )
-                        .order_by(TranscriptChunk.embedding.cosine_distance(vector))
-                        .limit(5)
+                    col = transcript_chunks_col()
+                    results = col.query(
+                        query_embeddings=[vector],
+                        n_results=5,
+                        include=["documents", "metadatas"],
                     )
-                    rows = result.all()
-                    if not rows:
+                    docs = (results.get("documents") or [[]])[0]
+                    metas = (results.get("metadatas") or [[]])[0]
+                    if not docs:
                         return "No transcript content found."
                     parts = []
-                    for content, ts_ms, sid in rows:
+                    for doc, meta in zip(docs, metas):
+                        ts_ms = int(meta.get("timestamp_ms", 0))
+                        sid = meta.get("session_id", "?")
                         mins, secs = divmod(ts_ms // 1000, 60)
-                        parts.append(f"[Session {sid} — {mins:02d}:{secs:02d}] {content}")
+                        parts.append(f"[Session {sid} — {mins:02d}:{secs:02d}] {doc}")
                     return "\n\n".join(parts)
 
             except Exception as e:

@@ -15,6 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.core.config import settings
 from app.core.database import Base, engine, AsyncSessionLocal
 from app.services import ollama_client
+from app.services.chroma_client import init_collections
 from app.services.lesson_summary_worker import start_summary_worker
 from app.services.transcription import get_model
 
@@ -51,15 +52,9 @@ async def lifespan(app: FastAPI):
         await conn.run_sync(Base.metadata.create_all)
     logger.info("Database tables created / verified")
 
-    # Add chunk_index column to lesson_chunks if it was created before this migration
-    async with engine.begin() as conn:
-        await conn.execute(
-            __import__("sqlalchemy", fromlist=["text"]).text(
-                "ALTER TABLE lesson_chunks "
-                "ADD COLUMN IF NOT EXISTS chunk_index INTEGER NOT NULL DEFAULT 0;"
-            )
-        )
-    logger.info("lesson_chunks.chunk_index column ensured")
+    # Initialise ChromaDB collections
+    init_collections()
+    logger.info("ChromaDB collections initialised")
 
     # Seed default users (auth is deferred — v1 uses fixed IDs)
     await _seed_default_users()
