@@ -198,19 +198,38 @@ async def search_live_transcript_func(
 async def get_full_transcript_func(
     session_id: int,
     db: AsyncSession,
+    max_words: int = 400,
 ) -> str:
-    """Return the full ordered transcript for *session_id* (capped at 20 chunks)."""
+    """
+    Return the most recent transcript chunks for *session_id*, newest-first
+    up to *max_words* words, then reversed to chronological order.
+
+    Capped by word budget (not chunk count) to keep context predictable for
+    small models — 400 words ≈ 3–4 min of speech at a comfortable teaching pace.
+    """
     result = await db.execute(
         select(TranscriptChunk.content, TranscriptChunk.timestamp_ms)
         .where(TranscriptChunk.session_id == session_id)
-        .order_by(TranscriptChunk.timestamp_ms)
-        .limit(20)
+        .order_by(TranscriptChunk.timestamp_ms.desc())
+        .limit(200)   # safety ceiling; word budget will exhaust well before this
     )
     rows = result.all()
     if not rows:
         return "No transcript available for this session yet."
-    parts = []
+
+    selected: list[tuple[str, int]] = []
+    word_count = 0
     for content, ts_ms in rows:
+        chunk_words = len(content.split())
+        if word_count + chunk_words > max_words:
+            break
+        selected.append((content, ts_ms))
+        word_count += chunk_words
+
+    # Restore chronological order
+    selected.reverse()
+    parts = []
+    for content, ts_ms in selected:
         mins, secs = divmod(ts_ms // 1000, 60)
         parts.append(f"[{mins:02d}:{secs:02d}] {content}")
     return "\n".join(parts)

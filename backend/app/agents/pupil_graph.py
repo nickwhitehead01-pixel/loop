@@ -61,18 +61,35 @@ logger = logging.getLogger(__name__)
 _TRANSCRIPT_KEYWORDS = {"transcript", "said", "spoken", "recap", "everything", "audio", "recording"}
 _FULL_RECAP_KEYWORDS  = {"full recap", "entire lesson", "whole lesson", "everything said"}
 _LIST_KEYWORDS        = {"what lessons", "which lessons", "available lessons", "topics available", "list lessons"}
+# Live keywords: route to get_full_transcript (SQLite, always current) so
+# the pupil can ask about speech that hasn't yet been flushed to ChromaDB.
+_LIVE_KEYWORDS        = {"just said", "just now", "right now", "currently", "latest", "just mentioned"}
 
 
 def _dispatch_tool(user_message: str, session_id: int | None) -> str:
-    """Return the name of the single retrieval tool to invoke this turn."""
+    """Return the name of the single retrieval tool to invoke this turn.
+
+    Transcript tools only activate when session_id is present.
+    Without a session_id, transcript keyword queries fall through to
+    retrieve_context so the agent searches lesson chunks — which includes
+    any transcript files the teacher uploaded alongside lesson materials.
+    """
     msg = user_message.lower()
     if session_id:
+        # Live/recency queries — must check before _TRANSCRIPT_KEYWORDS
+        if any(phrase in msg for phrase in _LIVE_KEYWORDS):
+            logger.info("Dispatch → get_full_transcript (live keyword, session=%d)", session_id)
+            return "get_full_transcript"
         if any(phrase in msg for phrase in _FULL_RECAP_KEYWORDS):
+            logger.info("Dispatch → get_full_transcript (full recap, session=%d)", session_id)
             return "get_full_transcript"
         if any(kw in msg for kw in _TRANSCRIPT_KEYWORDS):
+            logger.info("Dispatch → search_transcript (transcript keyword, session=%d)", session_id)
             return "search_transcript"
     if any(phrase in msg for phrase in _LIST_KEYWORDS):
+        logger.info("Dispatch → list_lessons")
         return "list_lessons"
+    logger.info("Dispatch → retrieve_context (session_id=%s)", session_id)
     return "retrieve_context"
 
 

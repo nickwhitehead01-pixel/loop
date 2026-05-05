@@ -26,6 +26,7 @@ from app.models.domain import (
     PupilSessionSummary,
     QuizAttempt,
     QuizQuestion,
+    SessionStatus,
 )
 from app.models.schemas import (
     LessonResponse,
@@ -74,6 +75,36 @@ async def pupil_chat(
             user_message = data.get("message", "").strip()
             conversation_id = data.get("conversation_id")
             session_id = data.get("session_id")
+
+            # Auto-resolve session_id if the client didn't provide one.
+            # Priority: (1) live session, (2) most recent session of any status.
+            # This means pupils never need to enter a session ID, and can ask
+            # about transcripts both during and after a lesson.
+            if not session_id:
+                live_result = await db.execute(
+                    select(LessonSession.id)
+                    .where(LessonSession.status == SessionStatus.live)
+                    .order_by(LessonSession.started_at.desc())
+                    .limit(1)
+                )
+                live_id = live_result.scalar_one_or_none()
+                if live_id is not None:
+                    session_id = live_id
+                    logger.info("Auto-resolved live session %d for pupil %d", session_id, pupil_id)
+                else:
+                    # No live session — fall back to the most recent session.
+                    recent_result = await db.execute(
+                        select(LessonSession.id)
+                        .order_by(LessonSession.started_at.desc())
+                        .limit(1)
+                    )
+                    recent_id = recent_result.scalar_one_or_none()
+                    if recent_id is not None:
+                        session_id = recent_id
+                        logger.info(
+                            "Auto-resolved recent session %d for pupil %d (no live session)",
+                            session_id, pupil_id,
+                        )
 
             if not user_message:
                 await websocket.send_json({"error": "Empty message"})

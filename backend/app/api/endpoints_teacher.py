@@ -162,23 +162,39 @@ def _incremental_transcript(previous: str, current: str) -> str:
 
 
 async def _persist_transcript_chunk(session_id: int, content: str, timestamp_ms: int) -> None:
-    """Persist transcript chunks asynchronously so websocket throughput stays realtime."""
+    """Persist transcript chunks to SQLite (immediately) and ChromaDB (after embed)."""
     if not content:
         return
 
+    import uuid as _uuid
     from app.services import ollama_client
+    from app.services.chroma_client import transcript_chunks_col
 
     try:
-        vector = await ollama_client.embed(content)
+        # Write to SQLite immediately — TranscriptChunk has no embedding column
         async with AsyncSessionLocal() as persist_db:
             chunk = TranscriptChunk(
                 session_id=session_id,
                 content=content,
-                embedding=vector,
                 timestamp_ms=timestamp_ms,
             )
             persist_db.add(chunk)
+            await persist_db.flush()
+            chunk_id = chunk.id
             await persist_db.commit()
+
+        # Embed and store in ChromaDB so the pupil agent can do semantic search
+        vector = await ollama_client.embed(content)
+        transcript_chunks_col().add(
+            ids=[str(_uuid.uuid4())],
+            embeddings=[vector],
+            documents=[content],
+            metadatas=[{
+                "session_id": str(session_id),
+                "timestamp_ms": str(timestamp_ms),
+                "sqlite_id": str(chunk_id),
+            }],
+        )
     except Exception as exc:
         logger.warning(
             "Transcript persistence failed for session %d: %s",
