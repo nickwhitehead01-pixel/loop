@@ -16,7 +16,7 @@ class Settings(BaseSettings):
 
     # App
     debug: bool = False
-    upload_dir: str = "/app/uploads"
+    upload_dir: str = "./uploads"
 
     # Whisper (speech-to-text)
     whisper_model_size: str = "small"

@@ -1,9 +1,9 @@
 import 'package:flutter/material.dart';
 
 import '../core/models/hub_settings.dart';
-import '../features/chat/presentation/chat_page.dart';
 import '../features/connection/data/hub_settings_store.dart';
 import '../features/connection/presentation/connect_page.dart';
+import '../features/transcript/presentation/session_picker_page.dart';
 import 'theme.dart';
 
 class PupilApp extends StatelessWidget {
@@ -40,7 +40,7 @@ class _AppGateState extends State<_AppGate> {
         }
 
         final HubSettings settings = snapshot.data!;
-        return ChatPage(initialSettings: settings);
+        return SessionPickerPage(settings: settings);
       },
     );
   }

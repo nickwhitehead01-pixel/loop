@@ -23,7 +23,7 @@ class ChatSocketClient {
     });
   }
 
-  void sendMessage({required String message, String? conversationId, String? sessionId}) {
+  void sendMessage({required String message, int? conversationId, int? sessionId}) {
     final Map<String, dynamic> payload = <String, dynamic>{
       'message': message,
       'conversation_id': conversationId,
