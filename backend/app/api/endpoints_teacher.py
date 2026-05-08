@@ -45,6 +45,7 @@ from app.models.domain import (
     QuizAttempt,
     QuizQuestion,
     Role,
+    SessionStatus,
     TeacherConversation,
     TranscriptChunk,
     User,
@@ -726,6 +727,13 @@ async def teacher_transcribe(
     _sess = sess_result.scalar_one_or_none()
     session_title = _sess.title if _sess else "Classroom lesson"
 
+    # Promote session from 'open' → 'live' now that transcription is starting.
+    if _sess and _sess.status == SessionStatus.open:
+        _sess.status = SessionStatus.live
+        await db.commit()
+        await db.refresh(_sess)
+        logger.info("Session %d promoted open → live", session_id)
+
     # Gather a compact lesson glossary linked to this session.
     lesson_glossary: dict[str, str] = {}
     try:
@@ -742,6 +750,11 @@ async def teacher_transcribe(
 
     raw_buffer: list[str] = []
     rationalize_in_flight = False
+
+    # Prompt-card accumulator — fires _generate_and_broadcast_prompt_cards every
+    # _TEACHER_CARD_INTERVAL utterances so pupils see context-aware suggestions.
+    _TEACHER_CARD_INTERVAL = 5
+    card_utterances: list[str] = []
 
     async def maybe_rationalize() -> None:
         nonlocal raw_buffer, rationalize_in_flight
@@ -794,6 +807,16 @@ async def teacher_transcribe(
                         # Persist asynchronously so embedding/database work does not block
                         # the next incoming audio chunk.
                         asyncio.create_task(_persist_transcript_chunk(session_id, emit_text, timestamp_ms))
+
+                        # Accumulate utterances and generate prompt cards for pupils.
+                        card_utterances.append(emit_text)
+                        if len(card_utterances) >= _TEACHER_CARD_INTERVAL:
+                            card_text = " ".join(card_utterances)
+                            card_utterances.clear()
+                            from app.api.endpoints_session import _generate_and_broadcast_prompt_cards  # noqa: PLC0415
+                            asyncio.create_task(
+                                _generate_and_broadcast_prompt_cards(session_id, card_text)
+                            )
 
                         # Buffer raw chunks and rationalize in small serialized batches.
                         raw_buffer.append(emit_text)

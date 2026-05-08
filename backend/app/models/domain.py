@@ -31,7 +31,8 @@ class MessageRole(str, enum.Enum):
 
 
 class SessionStatus(str, enum.Enum):
-    live = "live"
+    open = "open"    # lesson opened by teacher; pupils can join waiting room
+    live = "live"    # teacher started transcription
     ended = "ended"
 
 
