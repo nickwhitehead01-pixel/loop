@@ -149,13 +149,15 @@ async def list_pupil_sessions(
     pupil_id: int,
     db: AsyncSession = Depends(get_db),
 ):
-    """List sessions the pupil participated in (has conversations for)."""
+    """List every lesson session the pupil can join or replay.
+
+    Returns all sessions ordered newest-first so the pupil app can show
+    live sessions to attend and ended ones to revisit. The ``pupil_id``
+    is kept in the path for symmetry with other pupil routes and to allow
+    future per-pupil filtering, but currently does not constrain results.
+    """
     result = await db.execute(
-        select(LessonSession)
-        .join(Conversation, Conversation.session_id == LessonSession.id)
-        .where(Conversation.pupil_id == pupil_id)
-        .distinct()
-        .order_by(LessonSession.started_at.desc())
+        select(LessonSession).order_by(LessonSession.started_at.desc())
     )
     sessions = result.scalars().all()
     return [
