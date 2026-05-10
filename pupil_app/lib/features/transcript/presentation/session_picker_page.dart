@@ -126,7 +126,9 @@ class _SessionPickerPageState extends State<SessionPickerPage> {
 
   void _editConnection() {
     Navigator.of(context).pushReplacement(
-      MaterialPageRoute<ConnectPage>(builder: (_) => const ConnectPage()),
+      MaterialPageRoute<ConnectPage>(
+        builder: (_) => ConnectPage(initial: widget.settings),
+      ),
     );
   }
 
@@ -150,13 +152,23 @@ class _SessionPickerPageState extends State<SessionPickerPage> {
         title: Text('Choose a lesson', style: LoopType.speaker),
         actions: <Widget>[
           IconButton(
-            tooltip: 'Hub settings',
+            tooltip: 'Change Hub URL',
             onPressed: _editConnection,
             icon: const Icon(Icons.settings, color: LoopColors.ink),
           ),
         ],
       ),
-      body: SafeArea(child: _buildBody()),
+      body: SafeArea(
+        child: Column(
+          children: <Widget>[
+            Expanded(child: _buildBody()),
+            _HubFooter(
+              settings: widget.settings,
+              onChange: _editConnection,
+            ),
+          ],
+        ),
+      ),
     );
   }
 
@@ -344,6 +356,75 @@ class _ErrorState extends StatelessWidget {
           Text(message, style: LoopType.ui.copyWith(color: LoopColors.inkMuted)),
           const SizedBox(height: 20),
           OutlinedButton(onPressed: onRetry, child: const Text('Retry')),
+        ],
+      ),
+    );
+  }
+}
+
+/// Always-visible footer showing which hub + pupil the app is talking to,
+/// with a one-tap "Change" affordance so the URL is never hidden behind an
+/// unclear gear icon.
+class _HubFooter extends StatelessWidget {
+  const _HubFooter({required this.settings, required this.onChange});
+
+  final HubSettings settings;
+  final VoidCallback onChange;
+
+  String _displayHub() {
+    final Uri u = settings.hubUri;
+    final String authority = u.hasPort ? '${u.host}:${u.port}' : u.host;
+    return authority;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      decoration: const BoxDecoration(
+        color: LoopColors.paperShade,
+        border: Border(
+          top: BorderSide(color: LoopColors.inkSoft, width: 1),
+        ),
+      ),
+      padding: const EdgeInsets.symmetric(horizontal: 36, vertical: 14),
+      child: Row(
+        children: <Widget>[
+          const Icon(Icons.lan_outlined, size: 18, color: LoopColors.inkMuted),
+          const SizedBox(width: 10),
+          Expanded(
+            child: RichText(
+              text: TextSpan(
+                style: LoopType.ui.copyWith(
+                  color: LoopColors.inkMuted,
+                  fontWeight: FontWeight.w400,
+                ),
+                children: <InlineSpan>[
+                  const TextSpan(text: 'Hub  '),
+                  TextSpan(
+                    text: _displayHub(),
+                    style: LoopType.ui.copyWith(color: LoopColors.ink),
+                  ),
+                  const TextSpan(text: '   ·   Pupil  '),
+                  TextSpan(
+                    text: '${settings.pupilId}',
+                    style: LoopType.ui.copyWith(color: LoopColors.ink),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(width: 12),
+          TextButton(
+            onPressed: onChange,
+            style: TextButton.styleFrom(
+              foregroundColor: LoopColors.action,
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+            ),
+            child: Text(
+              'Change',
+              style: LoopType.ui.copyWith(color: LoopColors.action),
+            ),
+          ),
         ],
       ),
     );

@@ -2,12 +2,17 @@ import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart';
 
 import '../../../core/models/hub_settings.dart';
-import '../../chat/presentation/chat_page.dart';
+import '../../transcript/presentation/session_picker_page.dart';
 import '../data/hub_connection_repository.dart';
 import '../data/hub_settings_store.dart';
 
 class ConnectPage extends StatefulWidget {
-  const ConnectPage({super.key});
+  const ConnectPage({super.key, this.initial});
+
+  /// When opened from the picker's "Change" button, the page pre-fills with
+  /// the current settings so the pupil can tweak one field rather than
+  /// retype everything.
+  final HubSettings? initial;
 
   @override
   State<ConnectPage> createState() => _ConnectPageState();
@@ -15,8 +20,12 @@ class ConnectPage extends StatefulWidget {
 
 class _ConnectPageState extends State<ConnectPage> {
   final GlobalKey<FormState> _formKey = GlobalKey<FormState>();
-  final TextEditingController _hubUrlController = TextEditingController(text: _defaultHubUrl());
-  final TextEditingController _pupilIdController = TextEditingController(text: '1');
+  late final TextEditingController _hubUrlController = TextEditingController(
+    text: widget.initial?.hubUri.toString() ?? _defaultHubUrl(),
+  );
+  late final TextEditingController _pupilIdController = TextEditingController(
+    text: widget.initial?.pupilId.toString() ?? '1',
+  );
   final HubConnectionRepository _connectionRepo = const HubConnectionRepository();
   final HubSettingsStore _store = HubSettingsStore();
 
@@ -28,7 +37,7 @@ class _ConnectPageState extends State<ConnectPage> {
       // Android emulators use 10.0.2.2 to reach services running on the host machine.
       return 'http://10.0.2.2:8000';
     }
-    return 'http://192.168.50.60:8000';
+    return 'http://localhost:8000';
   }
 
   @override
@@ -104,7 +113,7 @@ class _ConnectPageState extends State<ConnectPage> {
     });
 
     Navigator.of(context).pushReplacement(
-      MaterialPageRoute<ChatPage>(builder: (_) => ChatPage(initialSettings: settings)),
+      MaterialPageRoute<void>(builder: (_) => SessionPickerPage(settings: settings)),
     );
   }
 
@@ -166,7 +175,7 @@ class _ConnectPageState extends State<ConnectPage> {
                 const SizedBox(height: 8),
                 FilledButton(
                   onPressed: _saving ? null : _saveAndContinue,
-                  child: Text(_saving ? 'Connecting...' : 'Continue to Chat'),
+                  child: Text(_saving ? 'Connecting...' : 'Continue'),
                 ),
               ],
             ),
