@@ -270,14 +270,27 @@ async def audio_stream(
                 timestamp_ms=timestamp_ms,
             )
             subscribers = _get_subscribers(session_id)
+            logger.info(
+                "[broadcast] session=%d subscribers=%d chars=%d",
+                session_id, len(subscribers), len(result.text),
+            )
             dead: list[WebSocket] = []
             for ws in subscribers:
                 try:
                     await ws.send_json(broadcast.model_dump())
-                except Exception:
+                except Exception as send_err:
+                    logger.warning(
+                        "[broadcast] session=%d send failed, marking dead: %s",
+                        session_id, send_err,
+                    )
                     dead.append(ws)
             for ws in dead:
                 subscribers.discard(ws)
+            if dead:
+                logger.info(
+                    "[broadcast] session=%d removed %d dead -> total subscribers=%d",
+                    session_id, len(dead), len(subscribers),
+                )
 
             # ── Bucket accumulation ────────────────────────────────────
             bucket_utterances.append(result.text)
@@ -358,7 +371,10 @@ async def subscribe_transcript(
     await websocket.accept()
     subscribers = _get_subscribers(session_id)
     subscribers.add(websocket)
-    logger.info("Pupil subscribed to session %d transcript", session_id)
+    logger.info(
+        "[subscribe] session=%d ADD -> total subscribers=%d",
+        session_id, len(subscribers),
+    )
 
     # Immediately deliver the latest prompt cards so late-joining pupils
     # don't have to wait for the next bucket flush.
@@ -375,7 +391,18 @@ async def subscribe_transcript(
             await websocket.receive_text()
     except WebSocketDisconnect:
         subscribers.discard(websocket)
-        logger.info("Pupil unsubscribed from session %d", session_id)
+        logger.info(
+            "[subscribe] session=%d DISCONNECT -> total subscribers=%d",
+            session_id, len(subscribers),
+        )
+    except Exception as exc:
+        # Any other error would otherwise leave a zombie WS in the set, which
+        # still gets iterated by the broadcast loop until a send finally errors.
+        subscribers.discard(websocket)
+        logger.warning(
+            "[subscribe] session=%d ERROR %s -> total subscribers=%d",
+            session_id, exc, len(subscribers),
+        )
 
 
 # ---------------------------------------------------------------------------

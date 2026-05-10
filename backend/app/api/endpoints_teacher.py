@@ -808,6 +808,33 @@ async def teacher_transcribe(
                         # the next incoming audio chunk.
                         asyncio.create_task(_persist_transcript_chunk(session_id, emit_text, timestamp_ms))
 
+                        # Broadcast to subscribed pupils so their live
+                        # transcript stays in sync with the teacher's UI.
+                        from app.api.endpoints_session import _get_subscribers  # noqa: PLC0415
+                        from app.models.schemas import TranscriptBroadcast  # noqa: PLC0415
+                        subscribers = _get_subscribers(session_id)
+                        if subscribers:
+                            payload = TranscriptBroadcast(
+                                content=emit_text,
+                                timestamp_ms=timestamp_ms,
+                            ).model_dump()
+                            dead: list = []
+                            for ws in subscribers:
+                                try:
+                                    await ws.send_json(payload)
+                                except Exception as send_err:
+                                    logger.warning(
+                                        "[broadcast] teacher_transcribe session=%d send failed: %s",
+                                        session_id, send_err,
+                                    )
+                                    dead.append(ws)
+                            for ws in dead:
+                                subscribers.discard(ws)
+                            logger.info(
+                                "[broadcast] teacher_transcribe session=%d subscribers=%d chars=%d",
+                                session_id, len(subscribers), len(emit_text),
+                            )
+
                         # Accumulate utterances and generate prompt cards for pupils.
                         card_utterances.append(emit_text)
                         if len(card_utterances) >= _TEACHER_CARD_INTERVAL:
