@@ -1,7 +1,9 @@
-enum SessionStatus { live, ended, unknown }
+enum SessionStatus { open, live, ended, unknown }
 
 SessionStatus _parseStatus(String? raw) {
   switch (raw) {
+    case 'open':
+      return SessionStatus.open;
     case 'live':
       return SessionStatus.live;
     case 'ended':
@@ -26,7 +28,8 @@ class LessonSession {
   final DateTime startedAt;
   final DateTime? endedAt;
 
-  bool get isLive => status == SessionStatus.live;
+  /// True when pupils can enter the session (opened or actively transcribing).
+  bool get isLive => status == SessionStatus.open || status == SessionStatus.live;
 
   factory LessonSession.fromJson(Map<String, dynamic> json) {
     return LessonSession(

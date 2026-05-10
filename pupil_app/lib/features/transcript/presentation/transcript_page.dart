@@ -7,8 +7,10 @@ import '../../../app/theme.dart';
 import '../../../core/models/hub_settings.dart';
 import '../../../core/models/lesson_session.dart';
 import '../../../core/models/transcript_chunk.dart';
+import '../../../core/models/prompt_card.dart';
 import '../../../core/widgets/composer.dart';
 import '../../../core/widgets/notebook_gutter.dart';
+import '../../../core/widgets/prompt_card_row.dart';
 import '../../../core/widgets/turn.dart' as ui;
 import '../../../core/widgets/waveform.dart';
 import '../../chat/data/chat_socket_client.dart';
@@ -58,7 +60,10 @@ class _TranscriptPageState extends State<TranscriptPage> {
   final List<_Entry> _entries = <_Entry>[];
 
   StreamSubscription<TranscriptChunk>? _transcriptSub;
+  StreamSubscription<List<PromptCard>>? _promptCardSub;
   StreamSubscription<ChatStreamFrame>? _chatSub;
+
+  List<PromptCard> _promptCards = const <PromptCard>[];
 
   String? _error;
   bool _historyLoaded = false;
@@ -80,6 +85,7 @@ class _TranscriptPageState extends State<TranscriptPage> {
     await _loadHistory();
     if (!mounted) return;
     _connectChat();
+    debugPrint('[TranscriptPage] session ${widget.session.id} isLive=${widget.session.isLive}');
     if (widget.session.isLive) {
       _connectTranscript();
     } else {
@@ -112,12 +118,17 @@ class _TranscriptPageState extends State<TranscriptPage> {
 
   void _connectTranscript() {
     _transcriptSub?.cancel();
-    final Stream<TranscriptChunk> stream = _transcriptClient.connect(
+    _promptCardSub?.cancel();
+
+    debugPrint('[TranscriptPage] Connecting transcript WS for session ${widget.session.id}');
+    _transcriptClient.connect(
       hubUri: widget.settings.hubUri,
       sessionId: widget.session.id,
     );
-    _transcriptSub = stream.listen(
+
+    _transcriptSub = _transcriptClient.transcriptChunks.listen(
       (TranscriptChunk chunk) {
+        debugPrint('[TranscriptPage] Received transcript chunk: ${chunk.content.length} chars');
         if (!mounted) return;
         setState(() {
           _entries.add(_Entry(speaker: _Speaker.teacher, text: chunk.content));
@@ -126,12 +137,22 @@ class _TranscriptPageState extends State<TranscriptPage> {
         _scrollToBottomSoon();
       },
       onError: (Object error) {
+        debugPrint('[TranscriptPage] Transcript WS error: $error');
         if (!mounted) return;
         setState(() => _error = _friendlyError(error));
       },
       onDone: () {
         // Transcript stream closed; the waveform will fall back to "waiting"
         // through the periodic recompute, so no explicit state to flip here.
+      },
+      cancelOnError: false,
+    );
+
+    _promptCardSub = _transcriptClient.promptCardUpdates.listen(
+      (List<PromptCard> cards) {
+        debugPrint('[TranscriptPage] Received ${cards.length} prompt cards');
+        if (!mounted) return;
+        setState(() => _promptCards = cards);
       },
       cancelOnError: false,
     );
@@ -249,6 +270,7 @@ class _TranscriptPageState extends State<TranscriptPage> {
   void dispose() {
     _waveTimer?.cancel();
     _transcriptSub?.cancel();
+    _promptCardSub?.cancel();
     _chatSub?.cancel();
     _transcriptClient.close();
     _chatClient.close();
@@ -267,7 +289,14 @@ class _TranscriptPageState extends State<TranscriptPage> {
         backgroundColor: LoopColors.paper,
         surfaceTintColor: LoopColors.paper,
         elevation: 0,
-        title: Text(widget.session.title, style: LoopType.speaker),
+        title: Row(
+          children: <Widget>[
+            Expanded(
+              child: Text(widget.session.title, style: LoopType.speaker),
+            ),
+            _SessionStatusPill(status: widget.session.status),
+          ],
+        ),
         leading: IconButton(
           tooltip: 'Back to lessons',
           icon: const Icon(Icons.arrow_back, color: LoopColors.ink),
@@ -281,6 +310,10 @@ class _TranscriptPageState extends State<TranscriptPage> {
             Padding(
               padding: const EdgeInsets.fromLTRB(36, 12, 36, 16),
               child: Waveform(state: _waveState),
+            ),
+            PromptCardRow(
+              cards: _promptCards,
+              onCardTap: _onSend,
             ),
             if (_error != null) _ErrorBanner(message: _error!),
             Expanded(child: _buildBody()),
@@ -300,6 +333,10 @@ class _TranscriptPageState extends State<TranscriptPage> {
   Widget _buildBody() {
     if (!_historyLoaded) {
       return const Center(child: CircularProgressIndicator());
+    }
+    // Waiting room: session is live but teacher hasn't spoken yet.
+    if (widget.session.isLive && _entries.isEmpty && _error == null) {
+      return const _WaitingRoom();
     }
     return Row(
       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -372,6 +409,113 @@ class _ErrorBanner extends StatelessWidget {
       child: Text(
         message,
         style: LoopType.ui.copyWith(color: LoopColors.error),
+      ),
+    );
+  }
+}
+
+/// Shown when the session is live but no speech has arrived yet.
+class _WaitingRoom extends StatelessWidget {
+  const _WaitingRoom();
+
+  @override
+  Widget build(BuildContext context) {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 48),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: <Widget>[
+            const SizedBox(
+              width: 40,
+              height: 40,
+              child: CircularProgressIndicator(
+                strokeWidth: 2,
+                color: LoopColors.action,
+              ),
+            ),
+            const SizedBox(height: 28),
+            Text(
+              'Waiting for your teacher…',
+              textAlign: TextAlign.center,
+              style: LoopType.ui.copyWith(color: LoopColors.inkMuted),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              'The lesson transcript will appear here once your teacher begins.',
+              textAlign: TextAlign.center,
+              style: LoopType.caption.copyWith(height: 1.5),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// LIVE / ENDED badge shown in the AppBar next to the session title.
+class _SessionStatusPill extends StatelessWidget {
+  const _SessionStatusPill({required this.status});
+
+  final SessionStatus status;
+
+  @override
+  Widget build(BuildContext context) {
+    final Color bg;
+    final Color fg;
+    final String label;
+
+    switch (status) {
+      case SessionStatus.open:
+        bg = const Color(0xFFFFF3DC);
+        fg = const Color(0xFFB96F00);
+        label = 'OPEN';
+        break;
+      case SessionStatus.live:
+        bg = const Color(0xFFDCE4F7);
+        fg = LoopColors.action;
+        label = 'LIVE';
+        break;
+      case SessionStatus.ended:
+        bg = LoopColors.paperInput;
+        fg = LoopColors.inkMuted;
+        label = 'ENDED';
+        break;
+      case SessionStatus.unknown:
+        return const SizedBox.shrink();
+    }
+
+    return Container(
+      height: 26,
+      padding: const EdgeInsets.symmetric(horizontal: 10),
+      decoration: BoxDecoration(
+        color: bg,
+        borderRadius: BorderRadius.circular(999),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: <Widget>[
+          if (status == SessionStatus.live || status == SessionStatus.open)
+            Container(
+              width: 6,
+              height: 6,
+              margin: const EdgeInsets.only(right: 6),
+              decoration: BoxDecoration(
+                color: fg,
+                shape: BoxShape.circle,
+              ),
+            ),
+          Text(
+            label,
+            style: TextStyle(
+              fontFamily: LoopType.family,
+              fontSize: 11,
+              fontWeight: FontWeight.w700,
+              letterSpacing: 0.5,
+              color: fg,
+            ),
+          ),
+        ],
       ),
     );
   }

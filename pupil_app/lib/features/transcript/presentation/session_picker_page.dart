@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
 import '../../../app/theme.dart';
@@ -10,6 +12,9 @@ import 'transcript_page.dart';
 /// Pupil's first stop after connect: pick which lesson session to enter.
 /// Live sessions float to the top with a blue LIVE pill; ended ones list
 /// below in muted ink so the pupil can revisit a past lesson.
+///
+/// Auto-polls every 5 seconds so a newly-started live session appears
+/// without the pupil needing to pull-to-refresh.
 class SessionPickerPage extends StatefulWidget {
   const SessionPickerPage({
     super.key,
@@ -30,13 +35,19 @@ class _SessionPickerPageState extends State<SessionPickerPage> {
   List<LessonSession>? _sessions;
   String? _error;
   bool _loading = false;
+  bool _navigating = false;
+
+  Timer? _pollTimer;
 
   @override
   void initState() {
     super.initState();
     _load();
+    // Poll every 5 seconds so a live session appears automatically.
+    _pollTimer = Timer.periodic(const Duration(seconds: 5), (_) => _silentLoad());
   }
 
+  /// Full load — shows spinner on first fetch, replaces list on subsequent.
   Future<void> _load() async {
     setState(() {
       _loading = true;
@@ -47,15 +58,7 @@ class _SessionPickerPageState extends State<SessionPickerPage> {
         hubUri: widget.settings.hubUri,
         pupilId: widget.settings.pupilId,
       );
-      result.sort((LessonSession a, LessonSession b) {
-        if (a.isLive != b.isLive) return a.isLive ? -1 : 1;
-        return b.startedAt.compareTo(a.startedAt);
-      });
-      if (!mounted) return;
-      setState(() {
-        _sessions = result;
-        _loading = false;
-      });
+      _applyResult(result);
     } catch (e) {
       if (!mounted) return;
       setState(() {
@@ -65,15 +68,60 @@ class _SessionPickerPageState extends State<SessionPickerPage> {
     }
   }
 
+  /// Silent background refresh — no spinner, no error banner.
+  Future<void> _silentLoad() async {
+    if (_navigating) return;
+    try {
+      final List<LessonSession> result = await _repo.listForPupil(
+        hubUri: widget.settings.hubUri,
+        pupilId: widget.settings.pupilId,
+      );
+      _applyResult(result);
+    } catch (_) {
+      // Silently ignore poll errors — next tick will retry.
+    }
+  }
+
+  void _applyResult(List<LessonSession> result) {
+    result.sort((LessonSession a, LessonSession b) {
+      if (a.isLive != b.isLive) return a.isLive ? -1 : 1;
+      return b.startedAt.compareTo(a.startedAt);
+    });
+    if (!mounted) return;
+
+    final List<LessonSession> prevSessions = _sessions ?? <LessonSession>[];
+    final bool wasNoLive = !prevSessions.any((LessonSession s) => s.isLive);
+    final List<LessonSession> nowLive =
+        result.where((LessonSession s) => s.isLive).toList();
+
+    setState(() {
+      _sessions = result;
+      _loading = false;
+    });
+
+    // Auto-navigate when a live session first appears and the pupil isn't
+    // already inside a session. If multiple live sessions exist, let them choose.
+    if (wasNoLive && nowLive.length == 1 && !_navigating) {
+      _open(nowLive.first);
+    }
+  }
+
   void _open(LessonSession session) {
-    Navigator.of(context).push(
-      MaterialPageRoute<void>(
-        builder: (_) => TranscriptPage(
-          settings: widget.settings,
-          session: session,
-        ),
-      ),
-    );
+    _navigating = true;
+    Navigator.of(context)
+        .push(
+          MaterialPageRoute<void>(
+            builder: (_) => TranscriptPage(
+              settings: widget.settings,
+              session: session,
+            ),
+          ),
+        )
+        .then((_) {
+      // Refresh immediately on return so status (live→ended) is up to date.
+      _navigating = false;
+      _load();
+    });
   }
 
   void _editConnection() {
@@ -84,6 +132,7 @@ class _SessionPickerPageState extends State<SessionPickerPage> {
 
   @override
   void dispose() {
+    _pollTimer?.cancel();
     if (widget.repository == null) {
       _repo.dispose();
     }
@@ -196,6 +245,11 @@ class _StatusPill extends StatelessWidget {
     final Color fg;
     final String label;
     switch (status) {
+      case SessionStatus.open:
+        bg = const Color(0xFFFFF3DC); // warm amber-soft
+        fg = const Color(0xFFB96F00);
+        label = 'OPEN';
+        break;
       case SessionStatus.live:
         bg = const Color(0xFFDCE4F7); // info-soft
         fg = LoopColors.action;

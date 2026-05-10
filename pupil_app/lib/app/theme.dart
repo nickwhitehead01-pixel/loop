@@ -29,6 +29,26 @@ class LoopColors {
   static const Color errorSoft = Color(0xFFF2D9D6);
 }
 
+/// Accent colours used for the three prompt card slots.
+class LoopCardColors {
+  static const Color blue = Color(0xFF4A90D9);
+  static const Color green = Color(0xFF5BAD6F);
+  static const Color amber = Color(0xFFF5A623);
+
+  /// Map a [colorKey] string (from the server) to the corresponding [Color].
+  static Color colorFor(String colorKey) {
+    switch (colorKey) {
+      case 'green':
+        return green;
+      case 'amber':
+        return amber;
+      case 'blue':
+      default:
+        return blue;
+    }
+  }
+}
+
 class LoopType {
   static const String family = 'Lexend';
 
