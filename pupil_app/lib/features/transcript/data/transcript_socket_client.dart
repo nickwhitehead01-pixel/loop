@@ -6,12 +6,14 @@ import 'package:web_socket_channel/io.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 import '../../../core/models/prompt_card.dart';
+import '../../../core/models/tappable_term.dart';
 import '../../../core/models/transcript_chunk.dart';
 import '../../../core/networking/hub_uri.dart';
 
-/// Subscribes to `/session/ws/{id}/subscribe` and surfaces two typed streams:
+/// Subscribes to `/session/ws/{id}/subscribe` and surfaces typed streams:
 /// - [transcriptChunks]: live teacher speech frames
 /// - [promptCardUpdates]: context-aware pupil prompt card batches
+/// - [tappableTermUpdates]: vocabulary the pupil can tap to expand
 ///
 /// The client is **idempotent and self-healing**:
 /// - Repeated [connect] calls for the same session reuse the live channel
@@ -30,9 +32,12 @@ class TranscriptSocketClient {
       StreamController<TranscriptChunk>.broadcast();
   final StreamController<List<PromptCard>> _promptCardController =
       StreamController<List<PromptCard>>.broadcast();
+  final StreamController<List<TappableTerm>> _tappableTermController =
+      StreamController<List<TappableTerm>>.broadcast();
 
   Stream<TranscriptChunk> get transcriptChunks => _transcriptController.stream;
   Stream<List<PromptCard>> get promptCardUpdates => _promptCardController.stream;
+  Stream<List<TappableTerm>> get tappableTermUpdates => _tappableTermController.stream;
 
   // Active target — used to know whether a repeat [connect] is redundant.
   Uri? _hubUri;
@@ -129,6 +134,19 @@ class TranscriptSocketClient {
             _promptCardController.add(cards);
           }
         }
+      } else if (type == 'tappable_terms') {
+        final dynamic raw = payload['terms'];
+        if (raw is List) {
+          final List<TappableTerm> terms = raw
+              .whereType<Map>()
+              .map((Map m) =>
+                  TappableTerm.fromJson(m.cast<String, dynamic>()))
+              .where((TappableTerm t) => t.term.isNotEmpty && t.explanation.isNotEmpty)
+              .toList();
+          if (terms.isNotEmpty && !_tappableTermController.isClosed) {
+            _tappableTermController.add(terms);
+          }
+        }
       }
     } catch (e) {
       debugPrint('[TranscriptSocketClient] dispatch error: $e');
@@ -169,5 +187,6 @@ class TranscriptSocketClient {
     _sessionId = null;
     if (!_transcriptController.isClosed) await _transcriptController.close();
     if (!_promptCardController.isClosed) await _promptCardController.close();
+    if (!_tappableTermController.isClosed) await _tappableTermController.close();
   }
 }

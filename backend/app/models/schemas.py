@@ -123,6 +123,29 @@ class TranscriptBroadcast(BaseModel):
     timestamp_ms: int
 
 
+# ── Tappable terms (vocabulary the pupil can tap to expand) ────────────────
+
+
+class TappableTerm(BaseModel):
+    """A single term Gemma has flagged as worth explaining.
+
+    The pupil app draws a dotted underline beneath any occurrence of *term*
+    in the live transcript; tapping reveals *explanation*.
+    """
+
+    term: str
+    explanation: str
+
+
+class TappableTermsBroadcast(BaseModel):
+    """Pushed to subscribed pupils whenever a new batch of tappable terms
+    is generated. The client merges by lowercased term and re-renders.
+    """
+
+    type: str = "tappable_terms"
+    terms: list[TappableTerm]
+
+
 # ── Pupil Session Summaries ────────────────────────────────────────────────
 
 class PupilSessionSummaryResponse(BaseModel):

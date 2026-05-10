@@ -248,6 +248,19 @@ To start fresh, delete `backend/data/` and re-run `python setup.py start`.
 
 ---
 
+## Roadmap
+
+Ideas parked for later passes — non-committal, write up as a proper RFC before
+starting any of them.
+
+### Tappable terms — personalisation
+The current tappable-terms service in [`backend/app/services/tappable_terms_service.py`](backend/app/services/tappable_terms_service.py) flags vocabulary using only the recent transcript bucket and a generic "11–15, SEN-aware" persona. A natural next step is to bias the selection toward the pupil's own profile — recent struggles, preferences, and concepts already covered — by pulling from their long-term memory in ChromaDB and adding a short context preamble to the prompt. Different pupils watching the same lesson would then see different words underlined.
+
+### Tappable terms — free-form tap
+At the moment only Gemma-pre-flagged words and short phrases are tappable. A second phase could let pupils long-press *any* word or selected phrase and ask the Class Helper for an explanation on demand, reusing the existing chat WebSocket. The pre-flagged path stays the default ("I don't know what to tap, the dotted underlines show me"); free-form covers the "I see something else confusing" case.
+
+---
+
 ## Development Guidelines
 
 **Branching & commits:**

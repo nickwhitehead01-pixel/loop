@@ -840,9 +840,18 @@ async def teacher_transcribe(
                         if len(card_utterances) >= _TEACHER_CARD_INTERVAL:
                             card_text = " ".join(card_utterances)
                             card_utterances.clear()
-                            from app.api.endpoints_session import _generate_and_broadcast_prompt_cards  # noqa: PLC0415
+                            from app.api.endpoints_session import (  # noqa: PLC0415
+                                _generate_and_broadcast_prompt_cards,
+                                _generate_and_broadcast_tappable_terms,
+                            )
                             asyncio.create_task(
                                 _generate_and_broadcast_prompt_cards(session_id, card_text)
+                            )
+                            # Fire-and-forget tappable terms in parallel — one
+                            # extra Gemma call per batch, same skip-if-busy
+                            # lock prevents pile-ups during fast speech.
+                            asyncio.create_task(
+                                _generate_and_broadcast_tappable_terms(session_id, card_text)
                             )
 
                         # Buffer raw chunks and rationalize in small serialized batches.
