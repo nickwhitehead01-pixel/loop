@@ -3,7 +3,7 @@ Live lesson session endpoints.
 
 POST /session/start              — teacher starts a live session
 WS   /ws/session/{id}/audio      — teacher streams audio for transcription
-POST /session/{id}/end           — teacher ends session, triggers summaries + quiz
+POST /session/{id}/end           — teacher ends session, triggers per-pupil summaries
 GET  /session/{id}/transcript    — get full transcript for a session
 """
 from __future__ import annotations
@@ -40,6 +40,11 @@ router = APIRouter(prefix="/session", tags=["sessions"])
 # Connected pupil WebSocket clients per session — {session_id: set(ws)}
 _pupil_subscribers: dict[int, set[WebSocket]] = {}
 
+# Connected teacher WebSocket clients per session. Separate from pupils so we
+# never accidentally broadcast a pupil's quiz answer to other pupils — only
+# the teacher's live answer board needs to see them.
+_teacher_subscribers: dict[int, set[WebSocket]] = {}
+
 # Per-session asyncio locks that serialise prompt-card generation.
 # If a bucket arrives while the previous Gemma call is still running the new
 # bucket is silently skipped — this prevents pile-ups during fast speech.
@@ -60,6 +65,45 @@ _session_tappable_terms: dict[int, dict[str, dict]] = {}
 
 def _get_subscribers(session_id: int) -> set[WebSocket]:
     return _pupil_subscribers.setdefault(session_id, set())
+
+
+def _get_teacher_subscribers(session_id: int) -> set[WebSocket]:
+    return _teacher_subscribers.setdefault(session_id, set())
+
+
+async def _broadcast(subscribers: set[WebSocket], payload: dict) -> None:
+    """Send *payload* to every WS in *subscribers*, dropping dead connections.
+
+    Shared helper so the per-event broadcast functions don't each reinvent the
+    dead-WS cleanup loop. Safe against modification during iteration because
+    we build the dead list separately.
+    """
+    dead: list[WebSocket] = []
+    for ws in subscribers:
+        try:
+            await ws.send_json(payload)
+        except Exception:
+            dead.append(ws)
+    for ws in dead:
+        subscribers.discard(ws)
+
+
+async def broadcast_to_pupils(session_id: int, payload: dict) -> None:
+    """Public: push *payload* to every pupil WS subscribed to *session_id*.
+
+    Used by other modules (quiz endpoints, grader) that need to fan events out
+    over the existing session websocket without owning the subscriber set.
+    """
+    await _broadcast(_get_subscribers(session_id), payload)
+
+
+async def broadcast_to_teacher(session_id: int, payload: dict) -> None:
+    """Public: push *payload* to the teacher's session WS (if connected).
+
+    Used to stream pupil answers and grader verdicts onto the live answer
+    board without exposing per-pupil data to other pupils.
+    """
+    await _broadcast(_get_teacher_subscribers(session_id), payload)
 
 
 async def _generate_and_broadcast_tappable_terms(
@@ -477,6 +521,54 @@ async def subscribe_transcript(
 
 
 # ---------------------------------------------------------------------------
+# WS /ws/session/{session_id}/teacher — teacher subscribes to quiz events
+# ---------------------------------------------------------------------------
+
+@router.websocket("/ws/{session_id}/teacher")
+async def subscribe_teacher(
+    websocket: WebSocket,
+    session_id: int,
+    db: AsyncSession = Depends(get_db),
+):
+    """Teacher connects to receive live quiz events for this session.
+
+    Distinct from the pupil /subscribe channel so pupil-specific events
+    (quiz_answer_received, quiz_attempt_graded) never reach other pupils.
+    """
+    result = await db.execute(
+        select(LessonSession).where(LessonSession.id == session_id)
+    )
+    session = result.scalar_one_or_none()
+    if not session:
+        await websocket.close(code=4004, reason="Session not found")
+        return
+
+    await websocket.accept()
+    subscribers = _get_teacher_subscribers(session_id)
+    subscribers.add(websocket)
+    logger.info(
+        "[teacher-ws] session=%d ADD -> total teacher subscribers=%d",
+        session_id, len(subscribers),
+    )
+
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        subscribers.discard(websocket)
+        logger.info(
+            "[teacher-ws] session=%d DISCONNECT -> total teacher subscribers=%d",
+            session_id, len(subscribers),
+        )
+    except Exception as exc:
+        subscribers.discard(websocket)
+        logger.warning(
+            "[teacher-ws] session=%d ERROR %s -> total teacher subscribers=%d",
+            session_id, exc, len(subscribers),
+        )
+
+
+# ---------------------------------------------------------------------------
 # POST /session/{session_id}/end
 # ---------------------------------------------------------------------------
 
@@ -501,8 +593,9 @@ async def end_session(
     await db.commit()
     await db.refresh(session)
 
-    # Trigger background summary + quiz generation
-    # Import here to avoid circular imports
+    # Trigger background per-pupil summary generation.
+    # (Auto-quiz at session end is removed — quizzes are teacher-driven live.)
+    # Import here to avoid circular imports.
     from app.services.summary import generate_session_artifacts
 
     asyncio.create_task(generate_session_artifacts(session_id))
@@ -511,14 +604,15 @@ async def end_session(
     _prompt_locks.pop(session_id, None)
     _latest_prompt_cards.pop(session_id, None)
 
-    # Clean up subscriber connections
-    subscribers = _pupil_subscribers.pop(session_id, set())
-    for ws in list(subscribers):  # copy to avoid Set changed size during iteration
-        try:
-            await ws.send_json({"type": "session_ended"})
-            await ws.close()
-        except Exception:
-            pass
+    # Clean up subscriber connections (both pupils and teacher).
+    for sub_dict in (_pupil_subscribers, _teacher_subscribers):
+        subscribers = sub_dict.pop(session_id, set())
+        for ws in list(subscribers):  # copy to avoid Set changed size during iteration
+            try:
+                await ws.send_json({"type": "session_ended"})
+                await ws.close()
+            except Exception:
+                pass
 
     return session
 

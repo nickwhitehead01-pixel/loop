@@ -109,10 +109,12 @@ app.add_middleware(
 from app.api.endpoints_pupil import router as pupil_router
 from app.api.endpoints_teacher import router as teacher_router
 from app.api.endpoints_session import router as session_router
+from app.api.endpoints_quiz import router as quiz_router
 
 app.include_router(pupil_router)
 app.include_router(teacher_router)
 app.include_router(session_router)
+app.include_router(quiz_router)
 
 
 @app.get("/health")

@@ -8,6 +8,7 @@ import '../../../core/models/hub_settings.dart';
 import '../../../core/models/lesson_session.dart';
 import '../../../core/models/transcript_chunk.dart';
 import '../../../core/models/prompt_card.dart';
+import '../../../core/models/quiz_question.dart';
 import '../../../core/models/tappable_term.dart';
 import '../../../core/widgets/composer.dart';
 import '../../../core/widgets/notebook_gutter.dart';
@@ -15,8 +16,10 @@ import '../../../core/widgets/prompt_card_row.dart';
 import '../../../core/widgets/turn.dart' as ui;
 import '../../../core/widgets/waveform.dart';
 import '../../chat/data/chat_socket_client.dart';
+import '../data/quiz_repository.dart';
 import '../data/sessions_repository.dart';
 import '../data/transcript_socket_client.dart';
+import 'quiz_modal.dart';
 
 /// Live-lesson surface: header waveform + LIVE pill, transcript Turn feed,
 /// 153px ruled scroll gutter on the right, composer pinned at the bottom for
@@ -56,6 +59,7 @@ class _TranscriptPageState extends State<TranscriptPage> {
   late final TranscriptSocketClient _transcriptClient =
       widget.transcriptClient ?? TranscriptSocketClient();
   late final ChatSocketClient _chatClient = widget.chatClient ?? ChatSocketClient();
+  final QuizRepository _quizRepository = QuizRepository();
 
   final ScrollController _scroll = ScrollController();
   final List<_Entry> _entries = <_Entry>[];
@@ -64,6 +68,13 @@ class _TranscriptPageState extends State<TranscriptPage> {
   StreamSubscription<List<PromptCard>>? _promptCardSub;
   StreamSubscription<List<TappableTerm>>? _tappableTermSub;
   StreamSubscription<ChatStreamFrame>? _chatSub;
+  StreamSubscription<QuizQuestion>? _quizOpenSub;
+  StreamSubscription<int>? _quizCloseSub;
+
+  /// The currently-open quiz question, if any. `null` whenever no modal
+  /// should be shown — set by the WS opened event and cleared by either the
+  /// closed event, the in-modal "Sent!" delay, or the timer expiring.
+  QuizQuestion? _activeQuizQuestion;
 
   List<PromptCard> _promptCards = const <PromptCard>[];
 
@@ -161,6 +172,29 @@ class _TranscriptPageState extends State<TranscriptPage> {
         debugPrint('[TranscriptPage] Received ${cards.length} prompt cards');
         if (!mounted) return;
         setState(() => _promptCards = cards);
+      },
+      cancelOnError: false,
+    );
+
+    // Quiz events ride the same /subscribe channel as transcript chunks —
+    // the backend's broadcast_to_pupils helper uses the same subscriber set.
+    _quizOpenSub = _transcriptClient.quizQuestionOpened.listen(
+      (QuizQuestion q) {
+        debugPrint('[TranscriptPage] quiz_question_opened id=${q.id}');
+        if (!mounted) return;
+        setState(() => _activeQuizQuestion = q);
+      },
+      cancelOnError: false,
+    );
+    _quizCloseSub = _transcriptClient.quizQuestionClosed.listen(
+      (int closedId) {
+        debugPrint('[TranscriptPage] quiz_question_closed id=$closedId');
+        if (!mounted) return;
+        // Only dismiss if it's the same question we're showing — guards
+        // against a stray late event from a previous question id.
+        if (_activeQuizQuestion?.id == closedId) {
+          setState(() => _activeQuizQuestion = null);
+        }
       },
       cancelOnError: false,
     );
@@ -294,9 +328,12 @@ class _TranscriptPageState extends State<TranscriptPage> {
     _transcriptSub?.cancel();
     _promptCardSub?.cancel();
     _tappableTermSub?.cancel();
+    _quizOpenSub?.cancel();
+    _quizCloseSub?.cancel();
     _chatSub?.cancel();
     _transcriptClient.close();
     _chatClient.close();
+    _quizRepository.dispose();
     if (widget.repository == null) {
       _repo.dispose();
     }
@@ -328,25 +365,45 @@ class _TranscriptPageState extends State<TranscriptPage> {
       ),
       body: SafeArea(
         bottom: false,
-        child: Column(
+        child: Stack(
           children: <Widget>[
-            Padding(
-              padding: const EdgeInsets.fromLTRB(36, 12, 36, 16),
-              child: Waveform(state: _waveState),
+            Column(
+              children: <Widget>[
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(36, 12, 36, 16),
+                  child: Waveform(state: _waveState),
+                ),
+                PromptCardRow(
+                  cards: _promptCards,
+                  onCardTap: _onSend,
+                ),
+                if (_error != null) _ErrorBanner(message: _error!),
+                Expanded(child: _buildBody()),
+                Composer(
+                  enabled: !_awaitingChatReply,
+                  onSend: _onSend,
+                  placeholder: _awaitingChatReply
+                      ? 'Class Helper is answering…'
+                      : 'Ask the Class Helper…',
+                ),
+              ],
             ),
-            PromptCardRow(
-              cards: _promptCards,
-              onCardTap: _onSend,
-            ),
-            if (_error != null) _ErrorBanner(message: _error!),
-            Expanded(child: _buildBody()),
-            Composer(
-              enabled: !_awaitingChatReply,
-              onSend: _onSend,
-              placeholder: _awaitingChatReply
-                  ? 'Class Helper is answering…'
-                  : 'Ask the Class Helper…',
-            ),
+            if (_activeQuizQuestion != null)
+              Positioned.fill(
+                child: QuizModal(
+                  // Key on the question id so a brand-new question replaces
+                  // the modal cleanly instead of inheriting stale state.
+                  key: ValueKey<int>(_activeQuizQuestion!.id),
+                  question: _activeQuizQuestion!,
+                  hubUri: widget.settings.hubUri,
+                  pupilId: widget.settings.pupilId,
+                  repository: _quizRepository,
+                  onDismiss: () {
+                    if (!mounted) return;
+                    setState(() => _activeQuizQuestion = null);
+                  },
+                ),
+              ),
           ],
         ),
       ),

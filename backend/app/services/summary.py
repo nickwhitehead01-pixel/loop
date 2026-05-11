@@ -20,7 +20,6 @@ from app.models.domain import (
     Message,
     MessageRole,
     PupilSessionSummary,
-    QuizQuestion,
     TranscriptChunk,
 )
 from app.services import ollama_client
@@ -46,38 +45,9 @@ async def _get_transcript_text(session_id: int, db: AsyncSession) -> str:
     return "\n".join(parts)
 
 
-async def _generate_quiz_questions(session_id: int, transcript: str, db: AsyncSession) -> None:
-    """Ask the LLM to generate 3-5 quiz questions from the transcript."""
-    if not transcript:
-        return
-
-    prompt = (
-        "Based on this lesson transcript, generate 3-5 quiz questions to test "
-        "student understanding. Each question should have a clear correct answer.\n\n"
-        f"Transcript:\n{transcript[:8000]}\n\n"
-        "Reply with ONLY a JSON array of objects, each with 'question' and 'answer' keys.\n"
-        'Example: [{"question": "What is photosynthesis?", "answer": "The process by which plants convert sunlight into energy"}]'
-    )
-
-    try:
-        raw = await ollama_client.generate_full(
-            messages=[{"role": "user", "content": prompt}],
-            model=settings.ollama_model_teacher,
-        )
-        start = raw.find("[")
-        end = raw.rfind("]") + 1
-        if start != -1 and end > start:
-            questions = json.loads(raw[start:end])
-            for q in questions:
-                if isinstance(q, dict) and "question" in q and "answer" in q:
-                    db.add(QuizQuestion(
-                        session_id=session_id,
-                        question_text=q["question"],
-                        correct_answer=q["answer"],
-                    ))
-            await db.flush()
-    except Exception as e:
-        logger.warning("Quiz generation failed for session %d: %s", session_id, e)
+# NOTE: Auto-quiz generation at session end was removed. Quizzes are now
+# teacher-driven during the live lesson (see backend/app/api/endpoints_quiz.py).
+# No quiz is generated as a fallback — "no quiz" is a valid lesson outcome.
 
 
 async def _generate_pupil_summary(
@@ -163,9 +133,6 @@ async def generate_session_artifacts(session_id: int) -> None:
             if not transcript:
                 logger.info("No transcript for session %d, skipping artifacts", session_id)
                 return
-
-            # Generate quiz questions
-            await _generate_quiz_questions(session_id, transcript, db)
 
             # Find all pupils who participated (had conversations in this session)
             pupil_result = await db.execute(

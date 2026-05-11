@@ -25,7 +25,9 @@ from app.models.domain import (
     LessonSession,
     PupilSessionSummary,
     QuizAttempt,
+    QuizGrade,
     QuizQuestion,
+    QuizQuestionStatus,
     SessionStatus,
 )
 from app.models.schemas import (
@@ -228,30 +230,51 @@ async def submit_quiz_answer(
     body: QuizAnswerSubmit,
     db: AsyncSession = Depends(get_db),
 ):
-    # Verify question exists
+    # Verify question exists and is currently accepting answers. Pupils can
+    # only submit while the question is in 'sent' status — drafts haven't been
+    # broadcast yet, and closed questions are past the deadline.
     result = await db.execute(
         select(QuizQuestion).where(QuizQuestion.id == question_id)
     )
     question = result.scalar_one_or_none()
     if not question:
         raise HTTPException(status_code=404, detail="Question not found")
+    if question.status != QuizQuestionStatus.sent:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Question is not accepting answers (status: {question.status.value})",
+        )
 
-    # Simple correctness check (case-insensitive substring match)
-    is_correct = (
-        body.pupil_answer.strip().lower() in question.correct_answer.strip().lower()
-        or question.correct_answer.strip().lower() in body.pupil_answer.strip().lower()
-    )
-
+    # Grade is left null at submit time. The LLM grader runs in a batch once
+    # the question closes (see /quiz/questions/{qid}/close in the upcoming
+    # teacher endpoints) and populates grade + rationale for every attempt.
     attempt = QuizAttempt(
         question_id=question_id,
         pupil_id=pupil_id,
         pupil_answer=body.pupil_answer,
-        is_correct=is_correct,
+        grade=None,
+        grader_rationale=None,
     )
     db.add(attempt)
     await db.flush()
     await db.refresh(attempt)
     await db.commit()
+
+    # Push the answer onto the teacher's live answer board immediately. Grade
+    # is null at this point — the grade chip appears later when the grader
+    # runs (post-close) and broadcasts quiz_attempt_graded.
+    from app.api.endpoints_session import broadcast_to_teacher
+    await broadcast_to_teacher(question.session_id, {
+        "type": "quiz_answer_received",
+        "attempt": {
+            "id": attempt.id,
+            "question_id": question_id,
+            "pupil_id": pupil_id,
+            "pupil_answer": attempt.pupil_answer,
+            "submitted_at": attempt.submitted_at.isoformat() if attempt.submitted_at else None,
+        },
+    })
+
     return attempt
 
 
