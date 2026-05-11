@@ -8,6 +8,7 @@ import '../../../core/models/hub_settings.dart';
 import '../../../core/models/lesson_session.dart';
 import '../../../core/models/transcript_chunk.dart';
 import '../../../core/models/prompt_card.dart';
+import '../../../core/models/tappable_term.dart';
 import '../../../core/widgets/composer.dart';
 import '../../../core/widgets/notebook_gutter.dart';
 import '../../../core/widgets/prompt_card_row.dart';
@@ -61,9 +62,15 @@ class _TranscriptPageState extends State<TranscriptPage> {
 
   StreamSubscription<TranscriptChunk>? _transcriptSub;
   StreamSubscription<List<PromptCard>>? _promptCardSub;
+  StreamSubscription<List<TappableTerm>>? _tappableTermSub;
   StreamSubscription<ChatStreamFrame>? _chatSub;
 
   List<PromptCard> _promptCards = const <PromptCard>[];
+
+  /// Cumulative tappable-term lookup, keyed by lowercased term so re-broadcasts
+  /// can revise an existing explanation. Passed to every `Turn` so that a term
+  /// flagged in batch N also retroactively underlines its earlier occurrences.
+  final Map<String, TappableTerm> _tappableTerms = <String, TappableTerm>{};
 
   String? _error;
   bool _historyLoaded = false;
@@ -119,6 +126,7 @@ class _TranscriptPageState extends State<TranscriptPage> {
   void _connectTranscript() {
     _transcriptSub?.cancel();
     _promptCardSub?.cancel();
+    _tappableTermSub?.cancel();
 
     debugPrint('[TranscriptPage] Connecting transcript WS for session ${widget.session.id}');
     _transcriptClient.connect(
@@ -153,6 +161,20 @@ class _TranscriptPageState extends State<TranscriptPage> {
         debugPrint('[TranscriptPage] Received ${cards.length} prompt cards');
         if (!mounted) return;
         setState(() => _promptCards = cards);
+      },
+      cancelOnError: false,
+    );
+
+    _tappableTermSub = _transcriptClient.tappableTermUpdates.listen(
+      (List<TappableTerm> terms) {
+        debugPrint('[TranscriptPage] Received ${terms.length} tappable terms');
+        if (!mounted) return;
+        setState(() {
+          // Merge; last-write-wins so re-broadcasts can revise an explanation.
+          for (final TappableTerm t in terms) {
+            _tappableTerms[t.term.toLowerCase()] = t;
+          }
+        });
       },
       cancelOnError: false,
     );
@@ -271,6 +293,7 @@ class _TranscriptPageState extends State<TranscriptPage> {
     _waveTimer?.cancel();
     _transcriptSub?.cancel();
     _promptCardSub?.cancel();
+    _tappableTermSub?.cancel();
     _chatSub?.cancel();
     _transcriptClient.close();
     _chatClient.close();
@@ -362,10 +385,15 @@ class _TranscriptPageState extends State<TranscriptPage> {
                   );
                 }
                 final _Entry e = _entries[i];
+                // Only the TEACHER turns benefit from tappable underlines —
+                // pupil's own words and the Class Helper's streamed reply
+                // would just be visual noise.
                 return ui.Turn(
                   speaker: _label(e.speaker),
                   text: e.text,
                   isStreaming: e.isStreaming,
+                  tappable: e.speaker == _Speaker.teacher,
+                  terms: _tappableTerms,
                 );
               },
             ),

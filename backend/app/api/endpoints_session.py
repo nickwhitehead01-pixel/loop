@@ -48,9 +48,68 @@ _prompt_locks: dict[int, asyncio.Lock] = {}
 # Most-recent prompt cards per session — sent immediately to late joiners.
 _latest_prompt_cards: dict[int, list[dict]] = {}
 
+# Per-session asyncio locks that serialise tappable-term generation.
+# Same skip-if-busy pattern as prompt cards.
+_tappable_locks: dict[int, asyncio.Lock] = {}
+
+# Cumulative tappable terms per session, keyed by lowercased term so re-runs
+# can revise an existing entry's explanation. Sent immediately to late joiners
+# so they don't have to wait for a fresh batch before seeing dotted underlines.
+_session_tappable_terms: dict[int, dict[str, dict]] = {}
+
 
 def _get_subscribers(session_id: int) -> set[WebSocket]:
     return _pupil_subscribers.setdefault(session_id, set())
+
+
+async def _generate_and_broadcast_tappable_terms(
+    session_id: int, bucket_text: str
+) -> None:
+    """Generate tappable terms for *bucket_text* and push to all subscribers.
+
+    Cumulative on the server: new terms are merged into the per-session map
+    so a pupil who joined mid-lesson can still see every term that's been
+    flagged so far (sent on subscribe via the late-join path below).
+    """
+    logger.warning(
+        "[tappable] entry session=%d bucket_words=%d",
+        session_id, len(bucket_text.split()),
+    )
+    lock = _tappable_locks.setdefault(session_id, asyncio.Lock())
+    if lock.locked():
+        logger.warning("[tappable] skip session=%d (lock busy)", session_id)
+        return
+    async with lock:
+        try:
+            from app.services.tappable_terms_service import generate_tappable_terms
+
+            new_terms = await generate_tappable_terms(bucket_text)
+        except Exception as exc:
+            logger.exception("[tappable] generation crashed: %s", exc)
+            return
+        if not new_terms:
+            logger.warning("[tappable] no terms returned session=%d", session_id)
+            return
+        store = _session_tappable_terms.setdefault(session_id, {})
+        for entry in new_terms:
+            store[entry["term"].lower()] = entry
+        payload = {"type": "tappable_terms", "terms": new_terms}
+        subscribers = _get_subscribers(session_id)
+        logger.warning(
+            "[tappable] broadcast session=%d subscribers=%d terms=%d",
+            session_id, len(subscribers), len(new_terms),
+        )
+        dead: list[WebSocket] = []
+        for ws in subscribers:
+            try:
+                await ws.send_json(payload)
+            except Exception as send_err:
+                logger.warning(
+                    "[tappable] send failed session=%d: %s", session_id, send_err,
+                )
+                dead.append(ws)
+        for ws in dead:
+            subscribers.discard(ws)
 
 
 async def _generate_and_broadcast_prompt_cards(
@@ -382,6 +441,18 @@ async def subscribe_transcript(
     if latest_cards:
         try:
             await websocket.send_json({"type": "prompt_cards", "cards": latest_cards})
+        except Exception:
+            pass
+
+    # Same for cumulative tappable terms so any historical chunk already in
+    # the pupil's REST-loaded transcript can be wrapped with dotted underlines.
+    tappable_store = _session_tappable_terms.get(session_id)
+    if tappable_store:
+        try:
+            await websocket.send_json({
+                "type": "tappable_terms",
+                "terms": list(tappable_store.values()),
+            })
         except Exception:
             pass
 
