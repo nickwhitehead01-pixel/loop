@@ -24,7 +24,7 @@ interface Lesson {
 interface SessionInfo {
   id: number;
   title: string;
-  status: "live" | "ended";
+  status: "open" | "live" | "ended";
 }
 
 interface TranscriptChunkResponse {
@@ -326,6 +326,8 @@ function SessionsPanel({ teacherId }: { teacherId: number }) {
   const [selectedLessonId, setSelectedLessonId] = useState<number | null>(null);
   const [activeSession, setActiveSession] = useState<SessionInfo | null>(null);
   const [starting, setStarting] = useState(false);
+  const [openingLesson, setOpeningLesson] = useState(false);
+  const [transcribing, setTranscribing] = useState(false);
   const [stopping, setStopping] = useState(false);
   const [liveTranscripts, setLiveTranscripts] = useState<string[]>([]);
   const [sessionError, setSessionError] = useState<string | null>(null);
@@ -524,18 +526,17 @@ function SessionsPanel({ teacherId }: { teacherId: number }) {
     animationFrameRef.current = requestAnimationFrame(tick);
   }, [activeSession]);
 
-  const startLiveSession = async () => {
+  /** Step 1 — teacher opens the lesson so pupils can join the waiting room. */
+  const openLesson = async () => {
     if (selectedLessonId == null) {
-      setSessionError("Select a lesson before starting a session.");
+      setSessionError("Select a lesson before opening it.");
       return;
     }
-
-    setStarting(true);
+    setOpeningLesson(true);
     setSessionError(null);
-
     try {
       const lesson = lessons.find((l) => l.id === selectedLessonId);
-      const response = await fetch(`${API}/session/start`, {
+      const response = await fetch(`${API}/session/open`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -544,18 +545,29 @@ function SessionsPanel({ teacherId }: { teacherId: number }) {
           title: lesson ? `Live: ${lesson.title}` : undefined,
         }),
       });
-
       if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(errorText || "Failed to start session.");
+        throw new Error((await response.text()) || "Failed to open lesson.");
       }
-
       const session = (await response.json()) as SessionInfo;
       activeSessionIdRef.current = session.id;
+      setActiveSession(session);
+      setLiveTranscripts([]);
+    } catch (e) {
+      setSessionError(e instanceof Error ? e.message : "Could not open lesson.");
+    } finally {
+      setOpeningLesson(false);
+    }
+  };
 
+  /** Step 2 — teacher starts microphone + transcription for an already-opened session. */
+  const startTranscription = async () => {
+    if (!activeSession) return;
+    setStarting(true);
+    setSessionError(null);
+    try {
       const mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
       streamRef.current = mediaStream;
-      const ws = new WebSocket(`${WS_BASE}/teacher/ws/${teacherId}/transcribe/${session.id}`);
+      const ws = new WebSocket(`${WS_BASE}/teacher/ws/${teacherId}/transcribe/${activeSession.id}`);
       socketRef.current = ws;
       setWaveState("waiting");
 
@@ -602,9 +614,7 @@ function SessionsPanel({ teacherId }: { teacherId: number }) {
             silenceDurationSecondsRef.current = 0;
           }
 
-          if (!speechActiveRef.current) {
-            return;
-          }
+          if (!speechActiveRef.current) return;
 
           audioChunksRef.current.push(copy);
           chunkDurationSecondsRef.current += seconds;
@@ -615,7 +625,6 @@ function SessionsPanel({ teacherId }: { teacherId: number }) {
             silenceDurationSecondsRef.current = 0;
           }
 
-          // End segment at a natural pause once minimum segment length is reached.
           if (
             silenceDurationSecondsRef.current >= TRANSCRIBE_SILENCE_HOLD_SECONDS
             && chunkDurationSecondsRef.current >= TRANSCRIBE_MIN_CHUNK_SECONDS
@@ -624,12 +633,13 @@ function SessionsPanel({ teacherId }: { teacherId: number }) {
             return;
           }
 
-          // Safety flush for very long uninterrupted speech.
           if (chunkDurationSecondsRef.current >= TRANSCRIBE_MAX_CHUNK_SECONDS) {
             flushAudioChunk();
           }
         };
 
+        setTranscribing(true);
+        setActiveSession((prev) => prev ? { ...prev, status: "live" } : prev);
         startWaveAnimation();
       };
 
@@ -643,7 +653,7 @@ function SessionsPanel({ teacherId }: { teacherId: number }) {
           if (payload.type === "transcript" && payload.text) {
             setLiveTranscripts((prev) => [...prev.slice(-20), payload.text as string]);
             setSessionError(null);
-            void refreshTranscript(session.id);
+            void refreshTranscript(activeSession.id);
           }
           if (payload.type === "rationalized" && payload.text && typeof (payload as { replaces?: number }).replaces === "number") {
             const replaces = (payload as { replaces: number }).replaces;
@@ -671,14 +681,11 @@ function SessionsPanel({ teacherId }: { teacherId: number }) {
         mediaStream.getTracks().forEach((track) => track.stop());
         socketRef.current = null;
         streamRef.current = null;
+        setTranscribing(false);
         resetAudioPipeline();
       };
-
-      setActiveSession(session);
-      setLiveTranscripts([]);
     } catch (e) {
-      console.error(e);
-      setSessionError(e instanceof Error ? e.message : "Could not start live session.");
+      setSessionError(e instanceof Error ? e.message : "Could not start transcription.");
       setWaveState("error");
     } finally {
       setStarting(false);
@@ -722,7 +729,7 @@ function SessionsPanel({ teacherId }: { teacherId: number }) {
       <h2 className="ll-heading">Sessions</h2>
 
       <div className="ll-card" style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-        <p className="ll-label">Start live session</p>
+        <p className="ll-label">Live session</p>
         <div style={{ display: "flex", flexWrap: "wrap", gap: 12, alignItems: "center" }}>
           <select
             value={selectedLessonId ?? ""}
@@ -743,13 +750,29 @@ function SessionsPanel({ teacherId }: { teacherId: number }) {
             ))}
           </select>
 
-          {activeSession ? (
-            <button className="ll-chip" onClick={stopLiveSession} disabled={stopping}>
-              {stopping ? "Stopping…" : `Stop Session #${activeSession.id}`}
+          {/* Step 1 — open lesson (no audio yet) */}
+          {!activeSession && (
+            <button className="ll-chip" onClick={openLesson} disabled={openingLesson || lessons.length === 0}>
+              {openingLesson ? "Opening…" : "Open Lesson"}
             </button>
-          ) : (
-            <button className="ll-chip" onClick={startLiveSession} disabled={starting || lessons.length === 0}>
-              {starting ? "Starting…" : "Start Session + Transcription"}
+          )}
+
+          {/* Step 2 — start transcription once lesson is open */}
+          {activeSession && activeSession.status === "open" && (
+            <button className="ll-chip" onClick={startTranscription} disabled={starting}>
+              {starting ? "Starting…" : "Start Transcription"}
+            </button>
+          )}
+
+          {/* End session (available once open or live) */}
+          {activeSession && (
+            <button
+              className="ll-chip"
+              onClick={stopLiveSession}
+              disabled={stopping}
+              style={{ background: "var(--error)" }}
+            >
+              {stopping ? "Stopping…" : `End Session #${activeSession.id}`}
             </button>
           )}
         </div>
@@ -757,9 +780,11 @@ function SessionsPanel({ teacherId }: { teacherId: number }) {
         {activeSession && (
           <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
             <p className="ll-body" style={{ color: "var(--ink-muted)" }}>
-              Live now: {activeSession.title} (session {activeSession.id})
+              {activeSession.status === "open"
+                ? `Lesson open — pupils can join: ${activeSession.title} (session ${activeSession.id})`
+                : `Live now: ${activeSession.title} (session ${activeSession.id})`}
             </p>
-            <WaveformCard state={waveState} levels={waveLevels} />
+            {transcribing && <WaveformCard state={waveState} levels={waveLevels} />}
           </div>
         )}
 
@@ -774,7 +799,11 @@ function SessionsPanel({ teacherId }: { teacherId: number }) {
                 color: "var(--ink-muted)",
               }}
             >
-              {activeSession ? "Listening for speech… transcript will appear here in real time." : "Start a live session to see transcript updates."}
+              {activeSession
+                ? activeSession.status === "open"
+                  ? "Lesson is open. Click \"Start Transcription\" to begin."
+                  : "Listening for speech… transcript will appear here in real time."
+                : "Open a lesson to begin."}
             </div>
           ) : (
             <div

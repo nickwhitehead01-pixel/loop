@@ -36,6 +36,7 @@ from app.models.domain import (
     User,
 )
 from app.services import ollama_client
+from app.services.chroma_client import lesson_chunks_col, teacher_memories_col, transcript_chunks_col
 
 logger = logging.getLogger(__name__)
 
@@ -44,22 +45,9 @@ logger = logging.getLogger(__name__)
 # Base system prompt
 # ---------------------------------------------------------------------------
 
-_BASE_SYSTEM = """You are a warm, collaborative Teaching Assistant helping a teacher manage their classroom. You are a peer and a sounding board.
-
-You have access to tools to:
-- get_lesson_summaries: retrieve AI-analysed summaries of uploaded lesson materials (pass lesson_title to search, or leave empty to list all)
-- search_lesson_content: search uploaded lesson materials for detailed content
-- get_class_analytics: get aggregated pupil performance metrics (optionally by session_id)
-- get_student_profile: get an individual pupil's progress and summaries
-- get_teacher_memories: recall facts about this teacher and class from previous sessions
-- search_transcript: search past lesson transcripts by topic (optionally by session_id)
-
-Core Directives:
-1. Use Tools Proactively: When the teacher asks about lessons, student progress, class analytics, or transcripts, use the appropriate tool immediately. These tools provide current, accurate data.
-2. Synthesize, Don't Dump: When you use a tool, don't just read the data back like a robot. Weave it into your conversation naturally.
-3. Be Conversational: Be warm, supportive, and collaborative. Ask clarifying questions if needed, offer insights, and suggest next steps based on data you retrieve.
-4. Respect Privacy: When discussing pupil data, summarise trends rather than exposing raw messages.
-"""
+_BASE_SYSTEM = """You are a warm, collaborative Teaching Assistant helping a teacher manage their classroom.
+Relevant data is provided in the [DATA] block below — use it to give accurate, grounded answers.
+Be conversational, synthesise insights, and respect pupil privacy by summarising rather than quoting raw data."""
 
 
 def _build_system_prompt(memories: list[str]) -> str:
@@ -96,12 +84,9 @@ async def get_lesson_summaries_impl(db: AsyncSession, teacher_id: int) -> str:
 async def search_lesson_content_impl(db: AsyncSession, user_message: str) -> str:
     """Search lesson content by semantic similarity."""
     vector = await ollama_client.embed(user_message)
-    result = await db.execute(
-        select(LessonChunk.content)
-        .order_by(LessonChunk.embedding.cosine_distance(vector))
-        .limit(5)
-    )
-    rows = result.scalars().all()
+    col = lesson_chunks_col()
+    results = col.query(query_embeddings=[vector], n_results=5, include=["documents"])
+    rows = (results.get("documents") or [[]])[0]
     return "\n\n---\n\n".join(rows) if rows else "No relevant lesson content found."
 
 
@@ -127,13 +112,17 @@ async def get_class_analytics_impl(db: AsyncSession) -> str:
 # Public entry point — called by the WebSocket endpoint
 # ---------------------------------------------------------------------------
 
-# Tool invocation keywords for direct dispatch
+# Tool invocation keywords — DB-only tools listed FIRST to avoid blocking embed calls.
+# Embed-dependent tools (search_lesson_content, get_teacher_memories, search_transcript)
+# only fire if no DB tool matched, keeping Ollama free to start the LLM sooner.
 TOOL_KEYWORDS = {
-    "get_lesson_summaries": ["lesson", "summary", "material", "upload", "cover", "content", "taught", "covered"],
-    "search_lesson_content": ["search", "find", "look for", "example", "specific", "contain"],
-    "get_class_analytics": ["analytics", "performance", "progress", "score", "understanding", "questions"],
-    "get_student_profile": ["student", "pupil", "progress", "profile", "performance"],
-    "get_teacher_memories": ["remember", "recall", "memory", "know about", "class"],
+    # --- DB-only (no embed, instant) ---
+    "get_lesson_summaries": ["lesson", "summary", "material", "upload", "taught", "covered", "available"],
+    "get_class_analytics": ["analytics", "performance", "class score", "understanding", "questions asked"],
+    "get_student_profile": ["student", "pupil", "profile"],
+    # --- Embed-dependent (queues on Ollama GPU — only reached if above didn't match) ---
+    "search_lesson_content": ["search", "find", "look for", "example", "specific", "contain", "content"],
+    "get_teacher_memories": ["remember", "recall", "memory", "know about"],
     "search_transcript": ["transcript", "said", "spoken", "audio", "recording"],
 }
 
@@ -164,11 +153,19 @@ async def _extract_and_store_memories(teacher_id: int, user_message: str, assist
         async with AsyncSessionLocal() as mem_db:
             for mem_text in new_memories:
                 vector = await ollama_client.embed(mem_text)
-                mem_db.add(TeacherMemory(
+                import uuid as _uuid
+                mem = TeacherMemory(
                     teacher_id=teacher_id,
                     memory=mem_text,
-                    embedding=vector,
-                ))
+                )
+                mem_db.add(mem)
+                await mem_db.flush()
+                teacher_memories_col().add(
+                    ids=[str(_uuid.uuid4())],
+                    embeddings=[vector],
+                    documents=[mem_text],
+                    metadatas=[{"teacher_id": str(teacher_id), "sqlite_id": str(mem.id)}],
+                )
             await mem_db.commit()
     except Exception:
         pass  # memory extraction must never surface errors
@@ -205,12 +202,9 @@ async def _detect_and_invoke_tool(user_message: str, db: AsyncSession, teacher_i
 
                 elif tool_name == "search_lesson_content":
                     vector = await ollama_client.embed(user_message)
-                    result = await db.execute(
-                        select(LessonChunk.content)
-                        .order_by(LessonChunk.embedding.cosine_distance(vector))
-                        .limit(5)
-                    )
-                    rows = result.scalars().all()
+                    col = lesson_chunks_col()
+                    results = col.query(query_embeddings=[vector], n_results=5, include=["documents"])
+                    rows = (results.get("documents") or [[]])[0]
                     return "\n\n---\n\n".join(rows) if rows else "No relevant lesson content found."
 
                 elif tool_name == "get_class_analytics":
@@ -243,33 +237,34 @@ async def _detect_and_invoke_tool(user_message: str, db: AsyncSession, teacher_i
 
                 elif tool_name == "get_teacher_memories":
                     vector = await ollama_client.embed(user_message)
-                    result = await db.execute(
-                        select(TeacherMemory.memory)
-                        .where(TeacherMemory.teacher_id == teacher_id)
-                        .order_by(TeacherMemory.embedding.cosine_distance(vector))
-                        .limit(5)
+                    col = teacher_memories_col()
+                    results = col.query(
+                        query_embeddings=[vector],
+                        n_results=5,
+                        where={"teacher_id": str(teacher_id)},
+                        include=["documents"],
                     )
-                    rows = result.scalars().all()
+                    rows = (results.get("documents") or [[]])[0]
                     return "\n".join(f"- {m}" for m in rows) if rows else "No relevant memories found."
 
                 elif tool_name == "search_transcript":
                     vector = await ollama_client.embed(user_message)
-                    result = await db.execute(
-                        select(
-                            TranscriptChunk.content,
-                            TranscriptChunk.timestamp_ms,
-                            TranscriptChunk.session_id,
-                        )
-                        .order_by(TranscriptChunk.embedding.cosine_distance(vector))
-                        .limit(5)
+                    col = transcript_chunks_col()
+                    results = col.query(
+                        query_embeddings=[vector],
+                        n_results=5,
+                        include=["documents", "metadatas"],
                     )
-                    rows = result.all()
-                    if not rows:
+                    docs = (results.get("documents") or [[]])[0]
+                    metas = (results.get("metadatas") or [[]])[0]
+                    if not docs:
                         return "No transcript content found."
                     parts = []
-                    for content, ts_ms, sid in rows:
+                    for doc, meta in zip(docs, metas):
+                        ts_ms = int(meta.get("timestamp_ms", 0))
+                        sid = meta.get("session_id", "?")
                         mins, secs = divmod(ts_ms // 1000, 60)
-                        parts.append(f"[Session {sid} — {mins:02d}:{secs:02d}] {content}")
+                        parts.append(f"[Session {sid} — {mins:02d}:{secs:02d}] {doc}")
                     return "\n\n".join(parts)
 
             except Exception as e:
@@ -293,39 +288,38 @@ async def run_teacher_agent(
     ))
     await db.flush()
 
-    # Load long-term teacher memories (most recent first, capped at 5)
-    mem_result = await db.execute(
-        select(TeacherMemory.memory)
-        .where(TeacherMemory.teacher_id == teacher_id)
-        .order_by(TeacherMemory.created_at.desc())
-        .limit(5)
+    # Fetch memories and history in parallel — both are independent DB reads
+    mem_result, hist_result = await asyncio.gather(
+        db.execute(
+            select(TeacherMemory.memory)
+            .where(TeacherMemory.teacher_id == teacher_id)
+            .order_by(TeacherMemory.created_at.desc())
+            .limit(5)
+        ),
+        db.execute(
+            select(TeacherMessage)
+            .where(TeacherMessage.conversation_id == conversation_id)
+            .order_by(TeacherMessage.created_at.desc())
+            .limit(settings.memory_window)
+        ),
     )
     prior_memories = list(mem_result.scalars().all())
+    history = list(reversed(hist_result.scalars().all()))
 
     # Try to detect and invoke appropriate tool
     tool_result = await _detect_and_invoke_tool(user_message, db, teacher_id)
 
-    # Build system prompt with tool results if available
+    # Build system prompt
     system_lines = [_BASE_SYSTEM]
     if prior_memories:
         block = "\n".join(f"- {m}" for m in prior_memories)
-        system_lines.append(f"\nWhat you know about this teacher and class:\n{block}\n")
-
+        system_lines.append(f"\nWhat you know about this teacher and class:\n{block}")
     if tool_result:
-        system_lines.append(f"\n[DATA RETRIEVED FROM TOOLS]:\n{tool_result}\n")
+        system_lines.append(f"\n[DATA]\n{tool_result}")
+    system_prompt = "\n".join(system_lines)
 
-    system_prompt = "".join(system_lines)
-
-    # Load recent conversation history
-    hist_result = await db.execute(
-        select(TeacherMessage)
-        .where(TeacherMessage.conversation_id == conversation_id)
-        .order_by(TeacherMessage.created_at.desc())
-        .limit(settings.memory_window)
-    )
-    history = list(reversed(hist_result.scalars().all()))
-    # Exclude the message we just inserted, then cap to last 10 messages
-    recent = history[:-1][-10:]
+    # Cap to last 6 messages (3 turns) — matches pupil agent, prevents prompt bloat
+    recent = history[:-1][-6:]
     lc_messages: list[BaseMessage] = [SystemMessage(content=system_prompt)]
     for m in recent:
         cls = HumanMessage if m.role == MessageRole.user else AIMessage

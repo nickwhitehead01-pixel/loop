@@ -29,8 +29,8 @@ The system is a four-node Edge AI ecosystem that runs entirely on a school's exi
 │   │           1. THE WINDOWS HUB  (Server Node)              │              │
 │   │                                                          │              │
 │   │  ┌─────────────┐  ┌──────────────┐  ┌────────────────┐  │              │
-│   │  │   Ollama    │  │   FastAPI    │  │  PostgreSQL    │  │              │
-│   │  │  gemma4:e2b │  │  + LangGraph │  │  + pgvector    │  │              │
+│   │  │   Ollama    │  │   FastAPI    │  │    SQLite      │  │              │
+│   │  │  gemma4:e2b │  │  + LangGraph │  │  + ChromaDB    │  │              │
 │   │  │  (local GPU)│  │  (reasoning) │  │  (memory + RAG)│  │              │
 │   │  └─────────────┘  └──────────────┘  └────────────────┘  │              │
 │   │                                                          │              │
@@ -52,11 +52,11 @@ The system is a four-node Edge AI ecosystem that runs entirely on a school's exi
 │   │ • Live captions │   │   agent       │   │   agent        │            │
 │   │ • Manage class  │   │ • Short &     │   │ • Short &      │            │
 │   │                 │   │   long-term   │   │   long-term    │            │
-│   │  native iOS app │   │   memory      │   │   memory       │            │
+│   │  Next.js app    │   │   memory      │   │   memory       │            │
 │   └─────────────────┘   │ • Apple TTS   │   │ • Apple TTS    │            │
 │                         │ • Guided      │   │ • Guided       │            │
 │                         │   Access      │   │   Access       │            │
-│                         │ native iOS app│   │ native iOS app │            │
+│                         │ Flutter app   │   │ Flutter app    │            │
 │                         └───────────────┘   └────────────────┘            │
 └─────────────────────────────────────────────────────────────────────────────┘
 
@@ -68,30 +68,34 @@ The system is a four-node Edge AI ecosystem that runs entirely on a school's exi
 ## The Four Nodes
 
 ### 1. The Windows Hub (Server Node)
-The IT admin downloads a **single 1-Click launcher** to any school-issued Windows Desktop. It silently spins up Ollama (with local hardware acceleration) and a Docker Compose stack containing the FastAPI backend, LangGraph reasoning engine, and a local PostgreSQL/pgvector database.
+The IT admin runs `python setup.py install` once to set up all dependencies, then `python setup.py start` to launch the hub. **No Docker required.** The setup script creates a Python virtual environment, installs all backend packages, installs the Next.js frontend, and creates the local data directories.
 
 The Hub is the central brain: it processes document RAG pipelines, runs faster-whisper for live classroom speech-to-text, and serves every student's personalised LangGraph agent simultaneously.
 
+**Storage:**
+- **SQLite** (`data/gemma_edu.db`) — all relational data: users, lessons, conversations, sessions, summaries, quizzes
+- **ChromaDB** (`data/chroma/`) — all vector embeddings: lesson chunks, transcript chunks, pupil/teacher memories, semantic cache
+
 ### 2. The Teacher Companion (Command Node)
-The teacher runs a **native iOS/iPadOS app** on their school iPad. They are never tethered to a desk.
+The teacher accesses the **Next.js web app** from any browser on the same Wi-Fi network. They are never tethered to a desk.
 
 - **Pre-lesson:** Upload lesson plans, PDFs, worksheets — synced instantly to the Hub to pre-load the AI's context for that session.
-- **Live lesson:** The iPad acts as a **high-fidelity wireless microphone**. The teacher's voice streams over the local network to the Hub, which:
+- **Live lesson:** Stream classroom audio from the browser. The Hub:
   1. Transcribes the audio in real-time using faster-whisper
   2. Chunks the transcript into semantic blocks (sentence-boundary aware)
-  3. Embeds each chunk via `nomic-embed-text` and stores it in pgvector
+  3. Embeds each chunk via `nomic-embed-text` and stores it in ChromaDB
   4. Broadcasts the new chunk to all connected pupil agents immediately
 
   This means every student's LangGraph agent has the teacher's words in its RAG context **within seconds** — students can ask questions about what was just said, even mid-lesson.
 
 ### 3. The Pupil Client (Edge Nodes)
-Each student's iPad runs a **native iOS/iPadOS app** distributed silently via MDM (Apple School Manager / Jamf). When opened, it uses **mDNS (Bonjour/ZeroConf)** to auto-discover the Windows Hub — no manual IP addresses required.
+Each student runs a **Flutter mobile app (iPad + Android, including Google Pixel)**. The app connects to the Hub URL over school Wi-Fi — entered once and saved locally.
 
 Each student logs into their **own personalised LangGraph agent** backed by:
 - **Short-term memory:** sliding window of recent conversation messages
-- **Long-term memory:** atomic learning facts (struggles, preferences, progress) stored as pgvector embeddings, retrieved by similarity each turn
+- **Long-term memory:** atomic learning facts (struggles, preferences, progress) stored as ChromaDB embeddings, retrieved by similarity each turn
 - **RAG context:** live teacher transcript chunks (streamed in real-time as the teacher speaks) + uploaded lesson materials
-- **Apple accessibility:** on-device Text-to-Speech and Guided Access for neurodivergent learners
+- **Accessibility:** on-device Text-to-Speech and simplified, low-cognitive-load UX for neurodivergent learners
 
 ### 4. The Infrastructure (Air-Gap)
 All communication is **entirely on the school's local Wi-Fi**. The system is air-gapped from the internet by design, inherently complying with FERPA, GDPR, and IEP data privacy regulations.
@@ -100,20 +104,19 @@ All communication is **entirely on the school's local Wi-Fi**. The system is air
 
 ## The Pupil Agent: A True Multi-Tool LangGraph Agent
 
-The pupil agent is a **ReAct-style LangGraph StateGraph**, not a simple chatbot. It has access to 8 tools during every turn:
+The pupil agent is a **ReAct-style LangGraph StateGraph**, not a simple chatbot. It has access to tools during every turn:
 
 | Tool | Purpose |
 |------|---------|
-| `retrieve_context` | pgvector similarity search over teacher-uploaded lesson chunks |
+| `retrieve_context` | ChromaDB similarity search over teacher-uploaded lesson chunks |
 | `search_live_transcript` | search the live classroom speech-to-text transcript |
 | `get_full_transcript` | retrieve the full ordered lesson transcript |
 | `get_conversation_history` | sliding window of recent messages (short-term memory) |
 | `load_all_pupil_memories` | inject long-term memory facts into system prompt |
 | `save_pupil_memories` | extract and persist new learning facts after each response |
 | `list_lessons` | enumerate available lesson materials |
-| `get_full_transcript` | full ordered transcript for deep context |
 
-After every response, Gemma 4 automatically extracts 1–3 learning facts from the conversation ("student struggles with fractions", "prefers visual analogies") and stores them as embeddings. On the next turn, relevant memories are retrieved by similarity and injected into the system prompt — **the agent adapts to each individual student across every lesson.**
+After every response, Gemma 4 automatically extracts 1–3 learning facts from the conversation ("student struggles with fractions", "prefers visual analogies") and stores them as ChromaDB embeddings. On the next turn, relevant memories are retrieved by similarity and injected into the system prompt — **the agent adapts to each individual student across every lesson.**
 
 ---
 
@@ -121,7 +124,7 @@ After every response, Gemma 4 automatically extracts 1–3 learning facts from t
 
 In a classroom of 30 students, many pupils ask the same question about the same lesson. Running Gemma 4 separately for each identical question wastes time and CPU cycles on constrained school hardware.
 
-The platform includes a **per-lesson semantic cache** backed by pgvector:
+The platform includes a **per-session semantic cache** backed by ChromaDB:
 
 ```
 Pupil asks question
@@ -130,7 +133,7 @@ Pupil asks question
  embed question (nomic-embed-text)
        │
        ▼
- cosine similarity search → semantic_cache table (scoped to lesson_id)
+ cosine similarity search → ChromaDB semantic_cache collection (scoped to session_id)
        │
   hit (≥ 0.92)?──────────── YES ──────── return cached answer instantly
        │
@@ -140,13 +143,13 @@ Pupil asks question
   run LangGraph agent → Gemma 4 generates answer
        │
        ▼
-  store (question_embedding, answer, lesson_id) in cache
+  store (question_embedding, answer, session_id) in ChromaDB
        │
        ▼
   return answer to pupil
 ```
 
-The cache is **lesson-scoped** — it resets when a new lesson session starts, so answers always reflect the current material. The similarity threshold (default 0.92) is configurable: lower it to cache more aggressively, raise it to be more precise. This makes the platform viable on modest school hardware even with a full class online simultaneously.
+The cache is **session-scoped** — it resets when a new lesson session starts, so answers always reflect the current material. The similarity threshold (default 0.92) is configurable via `SEMANTIC_CACHE_THRESHOLD` in `.env`. This makes the platform viable on modest school hardware even with a full class online simultaneously.
 
 ---
 
@@ -155,57 +158,49 @@ The cache is **lesson-scoped** — it resets when a new lesson session starts, s
 | Model | Used for | Why |
 |-------|----------|-----|
 | `gemma4:e2b` | Pupil chat + Teacher RAG (real-time streaming) | Strong reasoning, memory-efficient (~7.2 GB), runs on school hardware without a dedicated GPU |
-| `gemma4:e2b` | Fallback for memory-constrained hardware | Fits on 8 GB RAM, still capable for single-turn Q&A |
-| `nomic-embed-text` | pgvector embeddings (RAG + memory retrieval) | Fast, 768-dim vectors, fully local |
+| `nomic-embed-text` | ChromaDB embeddings (RAG + memory retrieval) | Fast, 768-dim vectors, fully local |
 | `faster-whisper` (tiny/small) | Live classroom speech-to-text | Runs on CPU, real-time on-device |
 
 ---
 
 ## Quick Start (Windows Hub)
 
-**Prerequisites:** Docker Desktop, ~15 GB free disk space, Ollama installed.
+**Prerequisites:** Python 3.11+, Node.js 18+, Ollama installed and running. No Docker required.
 
 ```bash
 git clone <repo-url>
 cd gemma-education-platform
 
-# Pull models
+# Pull models (first time only)
 ollama pull gemma4:e2b
 ollama pull nomic-embed-text
 
-# Start the backend stack
-cp .env.example .env
-docker-compose up
+# Install everything
+python setup.py install
+
+# Start the hub
+python setup.py start
 ```
 
-- API docs → http://localhost:8000/docs
-- Health   → http://localhost:8000/health
-- PoC UI   → http://localhost:8765 (run `python poc/poc_whisper_gemma.py`)
+- Teacher UI  → http://localhost:3000
+- API docs    → http://localhost:8000/docs
+- Health      → http://localhost:8000/health
 
----
+### What `setup.py install` does
+1. Checks Python ≥ 3.11 and Node.js ≥ 18
+2. Creates `backend/.venv` and installs all Python dependencies
+3. Runs `npm install` in `frontend/`
+4. Creates `backend/data/`, `backend/data/chroma/`, `backend/uploads/`
+5. Writes a `.env` file with sensible defaults (skips if it already exists)
+6. Verifies Ollama is reachable at `http://localhost:11434`
 
-## Development Setup
-
-**For local development, run Ollama on your host machine (not in Docker):**
+### What `setup.py start` does
+Launches the FastAPI backend (`uvicorn`, port 8000) and Next.js frontend (`npm run dev`, port 3000) as sub-processes. Ctrl-C shuts both down cleanly.
 
 ```bash
-# In one terminal, start Ollama on your host
-ollama serve
-
-# In another terminal, pull models if needed
-ollama pull gemma4:e2b
-ollama pull nomic-embed-text
-
-# Then start only the database and backend (comment out the ollama service in docker-compose.yml)
-docker-compose up postgres backend
+# Production mode (npm start instead of npm run dev)
+python setup.py start --prod
 ```
-
-This avoids:
-- Running LLM inference inside a container (performance overhead)
-- Duplicate model downloads
-- Resource contention on 16GB machines
-
-The backend will connect to your host Ollama via `OLLAMA_BASE_URL=http://localhost:11434` (set in `.env`).
 
 ---
 
@@ -214,10 +209,9 @@ The backend will connect to your host Ollama via `OLLAMA_BASE_URL=http://localho
 Before deploying the full stack, try the self-contained proof-of-concept:
 
 ```bash
-# Ensure Ollama is running on your host
+# Ensure Ollama is running
 ollama serve  # in another terminal
 
-# In your project terminal
 python3 -m venv venv && source venv/bin/activate
 pip install -r backend/requirements.txt
 
@@ -226,7 +220,20 @@ python poc/poc_whisper_gemma.py
 
 Open http://localhost:8765 — record your voice, get a live transcript, ask Gemma 4 a question about it. This is the core loop of the entire platform.
 
-The PoC uses your local Ollama instance directly (no Docker involved).
+---
+
+## Local Data
+
+All persistent data is stored inside the `backend/` directory — nothing is written outside the project folder:
+
+| Path | Contents |
+|------|----------|
+| `backend/data/gemma_edu.db` | SQLite database (users, lessons, conversations, sessions, quizzes) |
+| `backend/data/chroma/` | ChromaDB vector store (lesson chunks, transcript, memories, cache) |
+| `backend/uploads/` | Raw uploaded lesson files (PDF, DOCX, PPTX, TXT) |
+| `.env` | Configuration overrides (auto-generated by `setup.py install`) |
+
+To start fresh, delete `backend/data/` and re-run `python setup.py start`.
 
 ---
 
@@ -236,7 +243,7 @@ The PoC uses your local Ollama instance directly (no Docker involved).
 |------------|----------------|
 | FERPA | All data stays on school hardware — no internet egress |
 | GDPR | No cloud processing, no third-party data processors |
-| IEP confidentiality | Air-gapped network, local DB, no telemetry |
+| IEP confidentiality | Air-gapped network, local SQLite + ChromaDB, no telemetry |
 | COPPA | No accounts linked to cloud services, no data leaves school |
 
 ---

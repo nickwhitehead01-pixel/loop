@@ -5,7 +5,8 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 
     # Database
-    database_url: str = "postgresql+asyncpg://gemma_user:gemma_password@localhost:5432/gemma_education"
+    database_url: str = "sqlite+aiosqlite:///./data/gemma_edu.db"
+    chroma_dir: str = "./data/chroma"
 
     # Ollama
     ollama_base_url: str = "http://localhost:11434"
@@ -15,7 +16,7 @@ class Settings(BaseSettings):
 
     # App
     debug: bool = False
-    upload_dir: str = "/app/uploads"
+    upload_dir: str = "./uploads"
 
     # Whisper (speech-to-text)
     whisper_model_size: str = "small"
@@ -27,7 +28,7 @@ class Settings(BaseSettings):
     semantic_cache_threshold: float = 0.92
 
     # Transcript bucket — accumulate small VAD utterances before embedding/storing.
-    # A chunk is committed to pgvector when EITHER threshold is reached first.
+    # A chunk is committed to ChromaDB when EITHER threshold is reached first.
     transcript_bucket_min_words: int = 200   # ~matches lesson document chunk size
     transcript_bucket_max_seconds: int = 15  # safety flush for slow/quiet teachers
 

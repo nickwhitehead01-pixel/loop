@@ -45,6 +45,7 @@ from app.models.domain import (
     QuizAttempt,
     QuizQuestion,
     Role,
+    SessionStatus,
     TeacherConversation,
     TranscriptChunk,
     User,
@@ -162,23 +163,39 @@ def _incremental_transcript(previous: str, current: str) -> str:
 
 
 async def _persist_transcript_chunk(session_id: int, content: str, timestamp_ms: int) -> None:
-    """Persist transcript chunks asynchronously so websocket throughput stays realtime."""
+    """Persist transcript chunks to SQLite (immediately) and ChromaDB (after embed)."""
     if not content:
         return
 
+    import uuid as _uuid
     from app.services import ollama_client
+    from app.services.chroma_client import transcript_chunks_col
 
     try:
-        vector = await ollama_client.embed(content)
+        # Write to SQLite immediately — TranscriptChunk has no embedding column
         async with AsyncSessionLocal() as persist_db:
             chunk = TranscriptChunk(
                 session_id=session_id,
                 content=content,
-                embedding=vector,
                 timestamp_ms=timestamp_ms,
             )
             persist_db.add(chunk)
+            await persist_db.flush()
+            chunk_id = chunk.id
             await persist_db.commit()
+
+        # Embed and store in ChromaDB so the pupil agent can do semantic search
+        vector = await ollama_client.embed(content)
+        transcript_chunks_col().add(
+            ids=[str(_uuid.uuid4())],
+            embeddings=[vector],
+            documents=[content],
+            metadatas=[{
+                "session_id": str(session_id),
+                "timestamp_ms": str(timestamp_ms),
+                "sqlite_id": str(chunk_id),
+            }],
+        )
     except Exception as exc:
         logger.warning(
             "Transcript persistence failed for session %d: %s",
@@ -710,6 +727,13 @@ async def teacher_transcribe(
     _sess = sess_result.scalar_one_or_none()
     session_title = _sess.title if _sess else "Classroom lesson"
 
+    # Promote session from 'open' → 'live' now that transcription is starting.
+    if _sess and _sess.status == SessionStatus.open:
+        _sess.status = SessionStatus.live
+        await db.commit()
+        await db.refresh(_sess)
+        logger.info("Session %d promoted open → live", session_id)
+
     # Gather a compact lesson glossary linked to this session.
     lesson_glossary: dict[str, str] = {}
     try:
@@ -726,6 +750,11 @@ async def teacher_transcribe(
 
     raw_buffer: list[str] = []
     rationalize_in_flight = False
+
+    # Prompt-card accumulator — fires _generate_and_broadcast_prompt_cards every
+    # _TEACHER_CARD_INTERVAL utterances so pupils see context-aware suggestions.
+    _TEACHER_CARD_INTERVAL = 5
+    card_utterances: list[str] = []
 
     async def maybe_rationalize() -> None:
         nonlocal raw_buffer, rationalize_in_flight
@@ -778,6 +807,43 @@ async def teacher_transcribe(
                         # Persist asynchronously so embedding/database work does not block
                         # the next incoming audio chunk.
                         asyncio.create_task(_persist_transcript_chunk(session_id, emit_text, timestamp_ms))
+
+                        # Broadcast to subscribed pupils so their live
+                        # transcript stays in sync with the teacher's UI.
+                        from app.api.endpoints_session import _get_subscribers  # noqa: PLC0415
+                        from app.models.schemas import TranscriptBroadcast  # noqa: PLC0415
+                        subscribers = _get_subscribers(session_id)
+                        if subscribers:
+                            payload = TranscriptBroadcast(
+                                content=emit_text,
+                                timestamp_ms=timestamp_ms,
+                            ).model_dump()
+                            dead: list = []
+                            for ws in subscribers:
+                                try:
+                                    await ws.send_json(payload)
+                                except Exception as send_err:
+                                    logger.warning(
+                                        "[broadcast] teacher_transcribe session=%d send failed: %s",
+                                        session_id, send_err,
+                                    )
+                                    dead.append(ws)
+                            for ws in dead:
+                                subscribers.discard(ws)
+                            logger.info(
+                                "[broadcast] teacher_transcribe session=%d subscribers=%d chars=%d",
+                                session_id, len(subscribers), len(emit_text),
+                            )
+
+                        # Accumulate utterances and generate prompt cards for pupils.
+                        card_utterances.append(emit_text)
+                        if len(card_utterances) >= _TEACHER_CARD_INTERVAL:
+                            card_text = " ".join(card_utterances)
+                            card_utterances.clear()
+                            from app.api.endpoints_session import _generate_and_broadcast_prompt_cards  # noqa: PLC0415
+                            asyncio.create_task(
+                                _generate_and_broadcast_prompt_cards(session_id, card_text)
+                            )
 
                         # Buffer raw chunks and rationalize in small serialized batches.
                         raw_buffer.append(emit_text)

@@ -30,6 +30,7 @@ from app.models.schemas import (
     TranscriptChunkResponse,
 )
 from app.services import ollama_client
+from app.services.chroma_client import transcript_chunks_col
 from app.services.transcription import transcribe_chunk
 
 logger = logging.getLogger(__name__)
@@ -39,12 +40,84 @@ router = APIRouter(prefix="/session", tags=["sessions"])
 # Connected pupil WebSocket clients per session — {session_id: set(ws)}
 _pupil_subscribers: dict[int, set[WebSocket]] = {}
 
+# Per-session asyncio locks that serialise prompt-card generation.
+# If a bucket arrives while the previous Gemma call is still running the new
+# bucket is silently skipped — this prevents pile-ups during fast speech.
+_prompt_locks: dict[int, asyncio.Lock] = {}
+
+# Most-recent prompt cards per session — sent immediately to late joiners.
+_latest_prompt_cards: dict[int, list[dict]] = {}
+
 
 def _get_subscribers(session_id: int) -> set[WebSocket]:
     return _pupil_subscribers.setdefault(session_id, set())
 
 
+async def _generate_and_broadcast_prompt_cards(
+    session_id: int, bucket_text: str
+) -> None:
+    """Generate prompt cards for *bucket_text* and push to all subscribers."""
+    lock = _prompt_locks.setdefault(session_id, asyncio.Lock())
+    if lock.locked():
+        # Previous generation still running — skip rather than queue.
+        return
+    async with lock:
+        from app.services.prompt_card_service import generate_prompt_cards
+
+        cards = await generate_prompt_cards(bucket_text)
+        if not cards:
+            return
+        _latest_prompt_cards[session_id] = cards
+        payload = {"type": "prompt_cards", "cards": cards}
+        subscribers = _get_subscribers(session_id)
+        dead: list[WebSocket] = []
+        for ws in subscribers:
+            try:
+                await ws.send_json(payload)
+            except Exception:
+                dead.append(ws)
+        for ws in dead:
+            subscribers.discard(ws)
+
+
 # ---------------------------------------------------------------------------
+# POST /session/open
+# ---------------------------------------------------------------------------
+
+@router.post("/open", response_model=SessionResponse)
+async def open_session(
+    body: SessionCreate,
+    db: AsyncSession = Depends(get_db),
+):
+    """Teacher opens a lesson so pupils can join the waiting room.
+    The session is created with *open* status; transcription has not started yet.
+    Call POST /session/start to transition the same session to *live* (transcribing).
+    """
+    lesson_result = await db.execute(
+        select(Lesson).where(
+            Lesson.id == body.lesson_id,
+            Lesson.teacher_id == body.teacher_id,
+        )
+    )
+    lesson = lesson_result.scalar_one_or_none()
+    if lesson is None:
+        raise HTTPException(status_code=404, detail="Lesson not found for this teacher")
+
+    session = LessonSession(
+        teacher_id=body.teacher_id,
+        title=body.title or f"Session: {lesson.title}",
+        status=SessionStatus.open,
+    )
+    db.add(session)
+    await db.flush()
+
+    lesson.session_id = session.id
+
+    await db.commit()
+    await db.refresh(session)
+    return session
+
+
 # POST /session/start
 # ---------------------------------------------------------------------------
 
@@ -53,6 +126,10 @@ async def start_session(
     body: SessionCreate,
     db: AsyncSession = Depends(get_db),
 ):
+    """Legacy: creates a new session directly in *live* state (open + transcribing together).
+    Kept for backward compatibility. Prefer POST /session/open then the WS transcription
+    endpoint which auto-promotes the session to *live*.
+    """
     lesson_result = await db.execute(
         select(Lesson).where(
             Lesson.id == body.lesson_id,
@@ -92,12 +169,12 @@ async def audio_stream(
     Teacher connects and sends binary audio frames.
     Each frame is transcribed, embedded, stored, and broadcast to pupils.
     """
-    # Verify session exists and is live
+    # Verify session exists and is active (open or live)
     result = await db.execute(
         select(LessonSession).where(LessonSession.id == session_id)
     )
     session = result.scalar_one_or_none()
-    if not session or session.status != SessionStatus.live:
+    if not session or session.status == SessionStatus.ended:
         await websocket.close(code=4004, reason="Session not found or not live")
         return
 
@@ -106,29 +183,40 @@ async def audio_stream(
     logger.info("Teacher audio stream connected for session %d", session_id)
 
     # ------------------------------------------------------------------
-    # Bucket state — accumulates small VAD utterances before embedding.
-    # The frontend VAD (and live captions) are completely unaffected; we
-    # still ACK every utterance immediately.  Only the embed + DB write
-    # is deferred until the bucket is large enough to be useful for RAG.
+    # Bucket state — accumulates utterances before embedding for ChromaDB.
+    # SQLite receives each utterance immediately so the pupil agent can
+    # query it in real-time without waiting for the bucket to fill.
     # ------------------------------------------------------------------
     bucket_utterances: list[str] = []
     bucket_start_ms: int | None = None   # timestamp_ms of first utterance
     bucket_opened_at: float = time.time()
 
-    async def flush_bucket() -> None:
+    # ------------------------------------------------------------------
+    # Prompt-card accumulator — fires every CARD_INTERVAL utterances,
+    # independent of the ChromaDB bucket so cards appear quickly even
+    # during short sessions.
+    # ------------------------------------------------------------------
+    _CARD_INTERVAL = 5
+    card_utterances: list[str] = []
+
+    async def flush_bucket() -> str | None:
+        """Embed the accumulated bucket and write to ChromaDB only."""
         nonlocal bucket_utterances, bucket_start_ms, bucket_opened_at
         if not bucket_utterances:
-            return
+            return None
+        import uuid as _uuid
         joined = " ".join(bucket_utterances)
         vector = await ollama_client.embed(joined)
-        db.add(TranscriptChunk(
-            session_id=session_id,
-            content=joined,
-            embedding=vector,
-            timestamp_ms=bucket_start_ms or 0,
-        ))
-        await db.flush()
-        await db.commit()
+        # Store embedding in ChromaDB (SQLite write already happened per-utterance)
+        transcript_chunks_col().add(
+            ids=[str(_uuid.uuid4())],
+            embeddings=[vector],
+            documents=[joined],
+            metadatas=[{
+                "session_id": str(session_id),
+                "timestamp_ms": str(bucket_start_ms or 0),
+            }],
+        )
         logger.debug(
             "Flushed transcript bucket for session %d: %d utterances / %d words",
             session_id, len(bucket_utterances),
@@ -137,6 +225,7 @@ async def audio_stream(
         bucket_utterances = []
         bucket_start_ms = None
         bucket_opened_at = time.time()
+        return joined
 
     try:
         while True:
@@ -157,6 +246,16 @@ async def audio_stream(
 
             timestamp_ms = int((time.time() - session_start) * 1000)
 
+            # ── Immediate SQLite write — no embedding, no bucket wait ───
+            # This ensures the pupil agent can query the transcript in
+            # real-time even before the ChromaDB bucket is flushed.
+            db.add(TranscriptChunk(
+                session_id=session_id,
+                content=result.text,
+                timestamp_ms=timestamp_ms,
+            ))
+            await db.commit()
+
             # ── Live caption path (unchanged) ──────────────────────────
             # Acknowledge to teacher immediately so captions stay snappy.
             await websocket.send_json({
@@ -171,14 +270,27 @@ async def audio_stream(
                 timestamp_ms=timestamp_ms,
             )
             subscribers = _get_subscribers(session_id)
+            logger.info(
+                "[broadcast] session=%d subscribers=%d chars=%d",
+                session_id, len(subscribers), len(result.text),
+            )
             dead: list[WebSocket] = []
             for ws in subscribers:
                 try:
                     await ws.send_json(broadcast.model_dump())
-                except Exception:
+                except Exception as send_err:
+                    logger.warning(
+                        "[broadcast] session=%d send failed, marking dead: %s",
+                        session_id, send_err,
+                    )
                     dead.append(ws)
             for ws in dead:
                 subscribers.discard(ws)
+            if dead:
+                logger.info(
+                    "[broadcast] session=%d removed %d dead -> total subscribers=%d",
+                    session_id, len(dead), len(subscribers),
+                )
 
             # ── Bucket accumulation ────────────────────────────────────
             bucket_utterances.append(result.text)
@@ -191,13 +303,42 @@ async def audio_stream(
                 bucket_words >= settings.transcript_bucket_min_words
                 or bucket_age >= settings.transcript_bucket_max_seconds
             ):
-                await flush_bucket()
+                flushed_text = await flush_bucket()
+                if flushed_text:
+                    asyncio.create_task(
+                        _generate_and_broadcast_prompt_cards(session_id, flushed_text)
+                    )
+                    # Bucket flush already covers the recent speech; reset
+                    # the card-utterance accumulator to avoid double-firing.
+                    card_utterances.clear()
+                    continue
+
+            # ── Prompt-card interval trigger ───────────────────────────
+            card_utterances.append(result.text)
+            if len(card_utterances) >= _CARD_INTERVAL:
+                card_text = " ".join(card_utterances)
+                card_utterances.clear()
+                asyncio.create_task(
+                    _generate_and_broadcast_prompt_cards(session_id, card_text)
+                )
 
     except WebSocketDisconnect:
         logger.info("Teacher audio stream disconnected for session %d", session_id)
         # Flush any remaining utterances so nothing is lost on disconnect.
         try:
-            await flush_bucket()
+            flushed_text = await flush_bucket()
+            if flushed_text:
+                asyncio.create_task(
+                    _generate_and_broadcast_prompt_cards(session_id, flushed_text)
+                )
+            elif card_utterances:
+                # Bucket was empty (already flushed) but there are card utterances
+                # that haven't fired yet — generate cards from those.
+                card_text = " ".join(card_utterances)
+                card_utterances.clear()
+                asyncio.create_task(
+                    _generate_and_broadcast_prompt_cards(session_id, card_text)
+                )
         except Exception as flush_err:
             logger.warning("Could not flush bucket on disconnect for session %d: %s", session_id, flush_err)
     except Exception as e:
@@ -230,7 +371,19 @@ async def subscribe_transcript(
     await websocket.accept()
     subscribers = _get_subscribers(session_id)
     subscribers.add(websocket)
-    logger.info("Pupil subscribed to session %d transcript", session_id)
+    logger.info(
+        "[subscribe] session=%d ADD -> total subscribers=%d",
+        session_id, len(subscribers),
+    )
+
+    # Immediately deliver the latest prompt cards so late-joining pupils
+    # don't have to wait for the next bucket flush.
+    latest_cards = _latest_prompt_cards.get(session_id)
+    if latest_cards:
+        try:
+            await websocket.send_json({"type": "prompt_cards", "cards": latest_cards})
+        except Exception:
+            pass
 
     try:
         # Keep connection alive; pupil only receives, doesn't send
@@ -238,7 +391,18 @@ async def subscribe_transcript(
             await websocket.receive_text()
     except WebSocketDisconnect:
         subscribers.discard(websocket)
-        logger.info("Pupil unsubscribed from session %d", session_id)
+        logger.info(
+            "[subscribe] session=%d DISCONNECT -> total subscribers=%d",
+            session_id, len(subscribers),
+        )
+    except Exception as exc:
+        # Any other error would otherwise leave a zombie WS in the set, which
+        # still gets iterated by the broadcast loop until a send finally errors.
+        subscribers.discard(websocket)
+        logger.warning(
+            "[subscribe] session=%d ERROR %s -> total subscribers=%d",
+            session_id, exc, len(subscribers),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -272,9 +436,13 @@ async def end_session(
 
     asyncio.create_task(generate_session_artifacts(session_id))
 
+    # Clean up prompt-card state for this session
+    _prompt_locks.pop(session_id, None)
+    _latest_prompt_cards.pop(session_id, None)
+
     # Clean up subscriber connections
     subscribers = _pupil_subscribers.pop(session_id, set())
-    for ws in subscribers:
+    for ws in list(subscribers):  # copy to avoid Set changed size during iteration
         try:
             await ws.send_json({"type": "session_ended"})
             await ws.close()

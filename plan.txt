@@ -64,13 +64,13 @@ Four-Node Architecture:
        to Hub → generates live captions + AI context for all students
 
   3. PUPIL CLIENT (Edge Nodes)
-     - Native iOS/iPadOS app deployed silently via MDM (Apple School Manager / Jamf)
-     - Auto-discovers Windows Hub via mDNS — no manual IP required
+     - Cross-platform pupil app (iPad + Android phones/tablets incl. Pixel)
+     - Auto-discovers Windows Hub via mDNS/NSD with manual URL fallback
      - Each student has their own personalised LangGraph ReAct agent:
          Short-term memory:  sliding window of recent messages
          Long-term memory:   atomic learning facts (pgvector embeddings)
          RAG context:        live transcript + uploaded lesson materials
-     - Apple accessibility: on-device TTS, Guided Access (neurodivergent UX)
+     - Accessibility: on-device TTS + simplified UI for neurodivergent UX
 
   4. INFRASTRUCTURE (Air-Gap)
      - All traffic stays on school Wi-Fi (WLAN) — zero internet egress
@@ -83,8 +83,8 @@ Stack:
   - Embeddings: nomic-embed-text
   - STT:        faster-whisper (CPU, int8)
   - Hub OS:     Windows (Docker Desktop)
-  - Clients:    Native iOS/iPadOS apps
-  - Discovery:  mDNS / Bonjour / ZeroConf
+  - Clients:    SwiftUI teacher app (iPad) + Flutter pupil app (iPad + Android)
+  - Discovery:  mDNS / Bonjour / ZeroConf + Android NSD fallback
 
 Model Strategy:
   - Primary:  gemma4:e2b  (pupil chat + teacher RAG, good balance of capability & memory)
@@ -328,7 +328,7 @@ Analytics benefit
   - Teacher dashboard can surface "top questions this lesson"
 
 ----------------------------------------------------------------------
-PHASE 8 — iOS CLIENT APPS                                      [TODO]
+PHASE 8 — CLIENT APPS                                          [TODO]
 ----------------------------------------------------------------------
 
 8a. Teacher Companion (iOS/iPadOS)
@@ -339,18 +339,87 @@ PHASE 8 — iOS CLIENT APPS                                      [TODO]
   - Live captions view: subscribes to transcript broadcast WebSocket
   - Class dashboard: pupil list, session history, analytics
 
-8b. Pupil Client (iOS/iPadOS)
-  - Native SwiftUI app
-  - mDNS auto-discovery of Windows Hub (same Bonjour lookup)
-  - Student login (pupil_id selection — no cloud auth)
-  - Chat UI: WS /ws/pupil/{id}/chat with streaming token display
-  - Apple accessibility: AVSpeechSynthesizer (TTS), Guided Access support
-  - Lesson list: GET /pupil/{id}/lessons
-  - Quiz view: GET /pupil/{id}/sessions/{sid}/quiz
+8b. Pupil Client (Flutter: iPad + Android Pixel)             [IN PROGRESS]
+  Goal
+  - Deliver a production-ready Flutter pupil app at repo root:
+    /pupil_app
+  - Keep backend unchanged; consume existing FastAPI REST/WS endpoints
+  - Support both iPad and Android (Google Pixel) from one codebase
+  - Prioritise end-to-end classroom flow before platform polish
+
+  8b-1. Foundation and project scaffolding
+  - Create Flutter app with responsive layouts for iPad + Pixel form factors
+  - Use environment config for Hub URL (dev/prod), no hardcoded localhost
+  - Add local persistence for selected hub URL + pupil_id (offline restart safe)
+  - State management: Riverpod (or Bloc) with clear separation:
+    data layer (API/WS), domain models, presentation widgets
+
+  8b-2. Networking contract to current backend
+  - REST
+    GET /pupil/{id}/lessons
+    GET /pupil/{id}/sessions
+    GET /pupil/{id}/sessions/{sid}/summary
+    GET /pupil/{id}/sessions/{sid}/quiz
+    POST /pupil/{id}/quiz/{qid}/answer
+  - WebSocket
+    WS /ws/pupil/{id}/chat   (stream token frames)
+    WS /ws/session/{id}/subscribe (live transcript updates)
+  - Token stream contract:
+    read {"token":"...","done":false} frames and append incrementally
+    stop when {"token":"","done":true} arrives
+
+  8b-3. MVP user flow (ship first)
+  - Hub connect screen
+    manual hub URL entry + test connection + save locally
+  - Pupil select screen
+    choose pupil_id (v1: numeric/manual entry; no cloud auth)
+  - Chat screen
+    streaming response bubbles, cancel/retry, reconnect handling
+    optional session_id attached to chat payload when in live lesson
+  - Lessons screen
+    list available lessons for current pupil
+  - Quiz screen
+    load latest session quiz, submit answers, show correctness/feedback
+
+  8b-4. Accessibility and special-ed requirements
+  - Large tap targets, reduced cognitive load layout, predictable navigation
+  - Read-aloud button using iOS TTS from Flutter (platform channel/plugin)
+  - High-contrast theme mode and dyslexia-friendly text spacing option
+  - Guided Access compatibility checklist for classroom locking
+
+  8b-5. Realtime resilience
+  - WS reconnect with capped exponential backoff
+  - Distinguish transient network error vs server close vs malformed frame
+  - Preserve unsent draft message and restore after reconnect
+  - Show explicit connection state: Connected / Reconnecting / Offline
+
+  8b-6. Hub discovery and connection strategy (both platforms)
+  - Phase A (first working build): manual hub URL only
+  - Phase B (iPad): Bonjour discovery and one-tap connect
+  - Phase C (Android/Pixel): NSD discovery and one-tap connect
+  - Phase D: auto-select remembered hub hostname/IP when rediscovered
+  - Always keep manual override for classroom network edge cases
+
+  8b-7. Testing and QA gates
+  - Unit tests: token stream parser, reconnect policy, quiz scoring mapping
+  - Widget tests: chat streaming UI, offline banner, answer submission states
+  - Integration test: full flow against local backend in docker-compose
+  - Definition of done for Phase 8b:
+    pupil can connect, ask question, receive streamed answer,
+    view lessons, complete quiz, and recover from a dropped connection
+
+  8b-8. Suggested 6-day execution sequence
+  - Day 1: scaffold /pupil_app, routing, config, persisted hub URL
+  - Day 2: implement chat WS streaming and token-by-token rendering
+  - Day 3: lessons + sessions + summary/quiz REST integration
+  - Day 4: iPad + Pixel responsive QA, reconnect/offline resilience + tests
+  - Day 5: add discovery adapters (Bonjour + Android NSD) behind one interface
+  - Day 6: accessibility pass (TTS + large type), demo script for judging
 
 8c. MDM deployment
   - Package both apps as .ipa for silent distribution via
     Apple School Manager or Jamf
+  - Android rollout via managed Play / EMM for Pixel classroom devices
   - Hub URL pre-configured in MDM profile (or discovered via mDNS)
 
 ----------------------------------------------------------------------
