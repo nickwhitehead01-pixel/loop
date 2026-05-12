@@ -6,6 +6,7 @@ import 'package:web_socket_channel/io.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 import '../../../core/models/prompt_card.dart';
+import '../../../core/models/quiz_question.dart';
 import '../../../core/models/tappable_term.dart';
 import '../../../core/models/transcript_chunk.dart';
 import '../../../core/networking/hub_uri.dart';
@@ -34,10 +35,20 @@ class TranscriptSocketClient {
       StreamController<List<PromptCard>>.broadcast();
   final StreamController<List<TappableTerm>> _tappableTermController =
       StreamController<List<TappableTerm>>.broadcast();
+  // Quiz events flow over the same /subscribe channel — the teacher driver
+  // calls broadcast_to_pupils() with the same subscriber set, so a single
+  // socket gives us transcript, prompt cards, tappable terms, AND quizzes.
+  final StreamController<QuizQuestion> _quizOpenedController =
+      StreamController<QuizQuestion>.broadcast();
+  final StreamController<int> _quizClosedController =
+      StreamController<int>.broadcast();
 
   Stream<TranscriptChunk> get transcriptChunks => _transcriptController.stream;
   Stream<List<PromptCard>> get promptCardUpdates => _promptCardController.stream;
   Stream<List<TappableTerm>> get tappableTermUpdates => _tappableTermController.stream;
+  Stream<QuizQuestion> get quizQuestionOpened => _quizOpenedController.stream;
+  /// Emits the closed question's id so the UI can dismiss the matching modal.
+  Stream<int> get quizQuestionClosed => _quizClosedController.stream;
 
   // Active target — used to know whether a repeat [connect] is redundant.
   Uri? _hubUri;
@@ -134,6 +145,20 @@ class TranscriptSocketClient {
             _promptCardController.add(cards);
           }
         }
+      } else if (type == 'quiz_question_opened') {
+        try {
+          final QuizQuestion q = QuizQuestion.fromBroadcastJson(payload);
+          if (!_quizOpenedController.isClosed) {
+            _quizOpenedController.add(q);
+          }
+        } catch (e) {
+          debugPrint('[TranscriptSocketClient] bad quiz_question_opened: $e');
+        }
+      } else if (type == 'quiz_question_closed') {
+        final dynamic qid = payload['question_id'];
+        if (qid is num && !_quizClosedController.isClosed) {
+          _quizClosedController.add(qid.toInt());
+        }
       } else if (type == 'tappable_terms') {
         final dynamic raw = payload['terms'];
         if (raw is List) {
@@ -188,5 +213,7 @@ class TranscriptSocketClient {
     if (!_transcriptController.isClosed) await _transcriptController.close();
     if (!_promptCardController.isClosed) await _promptCardController.close();
     if (!_tappableTermController.isClosed) await _tappableTermController.close();
+    if (!_quizOpenedController.isClosed) await _quizOpenedController.close();
+    if (!_quizClosedController.isClosed) await _quizClosedController.close();
   }
 }

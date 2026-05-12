@@ -169,14 +169,73 @@ class QuizQuestionResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
+    quiz_id: int
     session_id: int
     question_text: str
-    correct_answer: str
+    # correct_answer is intentionally omitted from the pupil-facing schema —
+    # exposing it would let a pupil read the answer before submitting. Teacher
+    # endpoints use a separate schema that includes it.
+    topic_tag: str | None = None
+    status: str
+    time_limit_seconds: int
+    sent_at: datetime | None = None
+    closed_at: datetime | None = None
     created_at: datetime
 
 
 class QuizAnswerSubmit(BaseModel):
     pupil_answer: str = Field(..., min_length=1)
+
+
+# ── Teacher-facing quiz schemas ────────────────────────────────────────────
+#
+# These are separated from the pupil schemas above because they expose
+# `correct_answer` — pupils must never see it before submitting.
+
+class QuizStart(BaseModel):
+    mode: str = Field(..., pattern="^(one_at_a_time|batch)$")
+
+
+class QuizSuggestion(BaseModel):
+    """An LLM-drafted question, not yet persisted."""
+    question_text: str
+    correct_answer: str
+    topic_tag: str | None = None
+
+
+class TeacherQuizQuestionCreate(BaseModel):
+    question_text: str = Field(..., min_length=1)
+    correct_answer: str = Field(..., min_length=1)
+    topic_tag: str | None = None
+    source: str = Field(..., pattern="^(ai_suggested|ai_edited|teacher_manual)$")
+    time_limit_seconds: int = Field(default=20, ge=5, le=120)
+
+
+class TeacherQuizQuestionResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    quiz_id: int
+    session_id: int
+    question_text: str
+    correct_answer: str
+    topic_tag: str | None = None
+    status: str
+    source: str
+    time_limit_seconds: int
+    sent_at: datetime | None = None
+    closed_at: datetime | None = None
+    created_at: datetime
+
+
+class QuizResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    session_id: int
+    mode: str
+    started_at: datetime
+    questions: list[TeacherQuizQuestionResponse] = []
 
 
 class QuizAttemptResponse(BaseModel):
@@ -186,7 +245,10 @@ class QuizAttemptResponse(BaseModel):
     question_id: int
     pupil_id: int
     pupil_answer: str
-    is_correct: bool
+    # Null until the grader runs after the question closes.
+    grade: str | None = None
+    grader_rationale: str | None = None
+    submitted_at: datetime
     created_at: datetime
 
 

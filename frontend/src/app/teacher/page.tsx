@@ -5,6 +5,7 @@ import LessonDetail from "@/components/LessonDetail";
 import StudentProgress from "@/components/StudentProgress";
 import TeacherChat from "@/components/TeacherChat";
 import ConfirmDialog from "@/components/ConfirmDialog";
+import QuizPanel from "@/components/QuizPanel";
 
 const TEACHER_ID = 1;
 const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
@@ -861,6 +862,11 @@ function SessionsPanel({ teacherId }: { teacherId: number }) {
           <p className="ll-body" style={{ color: "var(--error)" }}>{sessionError}</p>
         )}
       </div>
+
+      {/* Quiz controls — only meaningful once the session is open and pupils
+          are in the room. Mounting unconditionally on activeSession means the
+          panel survives the open → live transition without remounting. */}
+      {activeSession && <QuizPanel sessionId={activeSession.id} />}
     </div>
   );
 }

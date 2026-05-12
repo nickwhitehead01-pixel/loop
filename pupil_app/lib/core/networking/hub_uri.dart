@@ -30,3 +30,6 @@ Uri sessionTranscriptUri(Uri hubUri, int sessionId) =>
     _http(hubUri, '/session/$sessionId/transcript');
 
 Uri healthUri(Uri hubUri) => _http(hubUri, '/health');
+
+Uri pupilQuizAnswerUri(Uri hubUri, int pupilId, int questionId) =>
+    _http(hubUri, '/pupil/$pupilId/quiz/$questionId/answer');

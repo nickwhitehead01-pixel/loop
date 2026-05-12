@@ -36,6 +36,29 @@ class SessionStatus(str, enum.Enum):
     ended = "ended"
 
 
+class QuizMode(str, enum.Enum):
+    one_at_a_time = "one_at_a_time"  # teacher reviews and sends each question individually
+    batch = "batch"                  # teacher queues several drafts then sends them together
+
+
+class QuizQuestionStatus(str, enum.Enum):
+    draft = "draft"      # created but not yet sent to pupils
+    sent = "sent"        # broadcast to pupils; accepting answers
+    closed = "closed"    # timer expired; no further answers accepted
+
+
+class QuizQuestionSource(str, enum.Enum):
+    ai_suggested = "ai_suggested"   # accepted from the LLM verbatim
+    ai_edited = "ai_edited"         # LLM suggestion modified by the teacher
+    teacher_manual = "teacher_manual"  # written entirely by the teacher
+
+
+class QuizGrade(str, enum.Enum):
+    correct = "correct"
+    partial = "partial"
+    incorrect = "incorrect"
+
+
 class User(Base):
     __tablename__ = "users"
 
@@ -101,8 +124,9 @@ class LessonSession(Base):
     summaries: Mapped[list[PupilSessionSummary]] = relationship(
         back_populates="session", cascade="all, delete-orphan"
     )
-    quiz_questions: Mapped[list[QuizQuestion]] = relationship(
-        back_populates="session", cascade="all, delete-orphan"
+    quiz: Mapped[Quiz | None] = relationship(
+        back_populates="session", cascade="all, delete-orphan",
+        uselist=False,
     )
 
 
@@ -283,29 +307,77 @@ class PupilSessionSummary(Base):
     session: Mapped[LessonSession] = relationship(back_populates="summaries")
 
 
+class Quiz(Base):
+    """A live quiz for a single lesson session.
+
+    One per session (enforced by the unique constraint on session_id). Created
+    when the teacher hits 'Start Quiz' and groups together every question they
+    ask during the lesson — whether sent one at a time or queued in a batch.
+    """
+    __tablename__ = "quizzes"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    session_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("lesson_sessions.id", ondelete="CASCADE"),
+        nullable=False, unique=True, index=True,
+    )
+    mode: Mapped[QuizMode] = mapped_column(
+        Enum(QuizMode), nullable=False, default=QuizMode.one_at_a_time
+    )
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    session: Mapped[LessonSession] = relationship(back_populates="quiz")
+    questions: Mapped[list[QuizQuestion]] = relationship(
+        back_populates="quiz", cascade="all, delete-orphan",
+        order_by="QuizQuestion.id",
+    )
+
+
 class QuizQuestion(Base):
-    """Auto-generated quiz question from a lesson session's transcript."""
+    """A single question within a quiz — drafted, then sent, then closed."""
     __tablename__ = "quiz_questions"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    quiz_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("quizzes.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    # Denormalised session_id so existing per-session queries don't need to
+    # join through Quiz. Kept in sync at creation time.
     session_id: Mapped[int] = mapped_column(
         Integer, ForeignKey("lesson_sessions.id", ondelete="CASCADE"),
         nullable=False, index=True,
     )
     question_text: Mapped[str] = mapped_column(Text, nullable=False)
     correct_answer: Mapped[str] = mapped_column(Text, nullable=False)
+    topic_tag: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    status: Mapped[QuizQuestionStatus] = mapped_column(
+        Enum(QuizQuestionStatus), nullable=False, default=QuizQuestionStatus.draft
+    )
+    source: Mapped[QuizQuestionSource] = mapped_column(
+        Enum(QuizQuestionSource), nullable=False
+    )
+    time_limit_seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=20)
+    sent_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    closed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
 
-    session: Mapped[LessonSession] = relationship(back_populates="quiz_questions")
+    quiz: Mapped[Quiz] = relationship(back_populates="questions")
     attempts: Mapped[list[QuizAttempt]] = relationship(
         back_populates="question", cascade="all, delete-orphan"
     )
 
 
 class QuizAttempt(Base):
-    """A pupil's answer to a quiz question."""
+    """A pupil's answer to a quiz question, with the LLM grader's verdict."""
     __tablename__ = "quiz_attempts"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
@@ -318,7 +390,15 @@ class QuizAttempt(Base):
         nullable=False, index=True,
     )
     pupil_answer: Mapped[str] = mapped_column(Text, nullable=False)
-    is_correct: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    # Grading happens in a batch after the question closes — until then this
+    # is nullable. Once the grader runs it is set to correct / partial / incorrect.
+    grade: Mapped[QuizGrade | None] = mapped_column(
+        Enum(QuizGrade), nullable=True, index=True
+    )
+    grader_rationale: Mapped[str | None] = mapped_column(Text, nullable=True)
+    submitted_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )

@@ -43,6 +43,7 @@ from app.models.domain import (
     Message,
     PupilSessionSummary,
     QuizAttempt,
+    QuizGrade,
     QuizQuestion,
     Role,
     SessionStatus,
@@ -594,7 +595,7 @@ async def student_progress(
     quiz_result = await db.execute(
         select(
             sa_func.count(QuizAttempt.id).label("total_attempts"),
-            sa_func.count(QuizAttempt.id).filter(QuizAttempt.is_correct.is_(True)).label("correct"),
+            sa_func.count(QuizAttempt.id).filter(QuizAttempt.grade == QuizGrade.correct).label("correct"),
         ).where(QuizAttempt.pupil_id == pupil_id)
     )
     quiz_row = quiz_result.one()
