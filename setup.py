@@ -84,8 +84,10 @@ def _write_env_if_missing() -> None:
         "OLLAMA_EMBED_MODEL=nomic-embed-text\n\n"
         "# File uploads directory (relative to backend/ directory)\n"
         "UPLOAD_DIR=./uploads\n\n"
-        "# Whisper model size: tiny, base, small, medium\n"
-        "WHISPER_MODEL_SIZE=small\n\n"
+        "# Whisper model size. The `.en` variants are English-only and ~30–40%\n"
+        "# faster than their multilingual counterparts. Tiers (fastest → most accurate):\n"
+        "# tiny.en, base.en, small.en, medium.en — or drop `.en` for multilingual.\n"
+        "WHISPER_MODEL_SIZE=base.en\n\n"
         "# Debug logging\n"
         "DEBUG=false\n"
     )

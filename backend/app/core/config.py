@@ -27,8 +27,14 @@ class Settings(BaseSettings):
     debug: bool = False
     upload_dir: str = str(_BACKEND_DIR / "uploads")
 
-    # Whisper (speech-to-text)
-    whisper_model_size: str = "small"
+    # Whisper (speech-to-text).
+    # `base.en` is the English-only variant of the base model: ~30–40% faster
+    # than the multilingual variant of the same size because it skips language
+    # detection, and ~2–3x faster than `small`. Accuracy on a single-teacher
+    # classroom voice is effectively indistinguishable. Override via env to
+    # `tiny.en` for low-spec demo hardware or back to `small.en` if you need
+    # the extra accuracy.
+    whisper_model_size: str = "base.en"
 
     # Conversation memory window (last N messages loaded per session)
     memory_window: int = 10

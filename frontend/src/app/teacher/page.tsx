@@ -38,12 +38,28 @@ type WaveState = "paused" | "waiting" | "listening" | "error";
 
 const WAVE_BAR_COUNT = 32;
 const IDLE_WAVE = Array.from({ length: WAVE_BAR_COUNT }, (_, idx) => 0.1 + ((idx % 5) * 0.025));
-const TRANSCRIBE_MIN_CHUNK_SECONDS = 0.6;
-const TRANSCRIBE_MAX_CHUNK_SECONDS = 6;
+// VAD timings tuned for "snappy" responsiveness over absolute accuracy.
+// A chunk flushes when EITHER (a) we've accumulated >= MIN seconds AND seen
+// >= SILENCE_HOLD seconds of silence, or (b) we've hit MAX seconds regardless.
+// So minimum end-to-end latency from sentence end → server ≈ SILENCE_HOLD.
+// Dropping MIN/SILENCE_HOLD from the old 0.6/0.35 to 0.4/0.2 trims ~0.35s
+// off perceived latency; the cost is slightly less context per Whisper call,
+// which is fine for a single clear teacher voice but would hurt in a noisy
+// room. Bump them back up if accuracy regresses.
+const TRANSCRIBE_MIN_CHUNK_SECONDS = 0.4;
+// Upper bound on a single audio chunk. There's a real trade-off here:
+//   - Higher values let Whisper land on natural silence boundaries → more
+//     accurate, but a teacher talking continuously sees a wall of text.
+//   - Lower values cap the worst-case latency, but a forced mid-utterance
+//     cut makes Whisper duplicate or drop the words straddling the boundary.
+// 4s is a middle ground: a teacher who pauses naturally will hit the
+// silence-based flush first (so accuracy is fine), and continuous speech
+// chunks at 4s — still snappy, fewer broken-word artifacts than at 2s.
+const TRANSCRIBE_MAX_CHUNK_SECONDS = 4;
 const TRANSCRIBE_MIN_RMS = 0.0015;
 const TRANSCRIBE_VOICE_ON_RMS = 0.003;
 const TRANSCRIBE_VOICE_OFF_RMS = 0.002;
-const TRANSCRIBE_SILENCE_HOLD_SECONDS = 0.35;
+const TRANSCRIBE_SILENCE_HOLD_SECONDS = 0.2;
 
 function writeWavHeader(view: DataView, sampleCount: number, sampleRate: number) {
   const writeString = (offset: number, value: string) => {
