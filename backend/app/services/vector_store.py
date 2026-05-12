@@ -6,6 +6,8 @@ search         — embed a query, return top-k chunk texts
 """
 from __future__ import annotations
 
+import base64
+import logging
 from io import BytesIO
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -15,7 +17,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.domain import LessonChunk
 from app.services.chroma_client import lesson_chunks_col
-from app.services.ollama_client import embed, embed_batch
+from app.services.ollama_client import describe_image, embed, embed_batch
+
+logger = logging.getLogger(__name__)
 
 # Chunks smaller than this (chars) are filtered after splitting — avoids noise
 MIN_CHUNK_CHARS = 80
@@ -84,6 +88,93 @@ def _extract_txt(data: bytes) -> str:
     return _sanitize_text(text)
 
 
+# ---------------------------------------------------------------------------
+# Image extraction — one function per format
+# Returns list of (location, image_bytes) where location is a 1-based
+# page/slide number (0 when location is unavailable, e.g. DOCX).
+# Images smaller than 2 KB are skipped (icons, decorative bullets, etc.).
+# ---------------------------------------------------------------------------
+
+_MIN_IMAGE_BYTES = 2048  # skip anything smaller than ~2 KB
+
+
+def _extract_images_pdf(data: bytes) -> list[tuple[int, bytes]]:
+    """Extract unique images from each PDF page via PyMuPDF."""
+    try:
+        import fitz  # PyMuPDF
+    except ImportError:
+        logger.warning("pymupdf not installed — PDF image extraction skipped")
+        return []
+    images: list[tuple[int, bytes]] = []
+    pdf = fitz.open(stream=data, filetype="pdf")
+    try:
+        seen_xrefs: set[int] = set()
+        for page_idx, page in enumerate(pdf):
+            for img_info in page.get_images(full=True):
+                xref = img_info[0]
+                if xref in seen_xrefs:
+                    continue
+                seen_xrefs.add(xref)
+                try:
+                    base_image = pdf.extract_image(xref)
+                    img_bytes = base_image["image"]
+                    if len(img_bytes) >= _MIN_IMAGE_BYTES:
+                        images.append((page_idx + 1, img_bytes))
+                except Exception:
+                    continue
+    finally:
+        pdf.close()
+    return images
+
+
+def _extract_images_pptx(data: bytes) -> list[tuple[int, bytes]]:
+    """Extract picture shapes from each PPTX slide."""
+    from pptx import Presentation
+    from pptx.enum.shapes import MSO_SHAPE_TYPE
+
+    images: list[tuple[int, bytes]] = []
+    prs = Presentation(BytesIO(data))
+    for slide_idx, slide in enumerate(prs.slides):
+        for shape in slide.shapes:
+            if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
+                try:
+                    img_bytes = shape.image.blob
+                    if len(img_bytes) >= _MIN_IMAGE_BYTES:
+                        images.append((slide_idx + 1, img_bytes))
+                except Exception:
+                    continue
+    return images
+
+
+def _extract_images_docx(data: bytes) -> list[tuple[int, bytes]]:
+    """Extract inline images from a DOCX document."""
+    from docx import Document
+
+    images: list[tuple[int, bytes]] = []
+    doc = Document(BytesIO(data))
+    for rel in doc.part.rels.values():
+        if "image" in rel.reltype:
+            try:
+                img_bytes = rel.target_part.blob
+                if len(img_bytes) >= _MIN_IMAGE_BYTES:
+                    images.append((0, img_bytes))
+            except Exception:
+                continue
+    return images
+
+
+def _extract_images(file_bytes: bytes, filename: str) -> list[tuple[int, bytes]]:
+    """Dispatch to the correct image extractor based on file extension."""
+    ext = ("." + filename.rsplit(".", 1)[-1].lower()) if "." in filename else ""
+    if ext == ".pdf":
+        return _extract_images_pdf(file_bytes)
+    if ext == ".pptx":
+        return _extract_images_pptx(file_bytes)
+    if ext == ".docx":
+        return _extract_images_docx(file_bytes)
+    return []
+
+
 def extract_text(file_bytes: bytes, filename: str) -> str:
     """
     Dispatch to the correct parser based on file extension.
@@ -119,6 +210,68 @@ def _chunk_text(text: str) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Located text extraction — returns (chunk_text, slide_number) pairs so that
+# every chunk carries a 1-based page/slide index for semantic slide-sync.
+# slide_number = 0 means "position unknown" (DOCX, TXT).
+# ---------------------------------------------------------------------------
+
+def _extract_pdf_located(data: bytes) -> list[tuple[str, int]]:
+    """Return one (page_text, page_number) entry per PDF page."""
+    reader = PdfReader(BytesIO(data))
+    result: list[tuple[str, int]] = []
+    for page_idx, page in enumerate(reader.pages):
+        text = page.extract_text()
+        if text:
+            result.append((_sanitize_text(text), page_idx + 1))
+    return result
+
+
+def _extract_pptx_located(data: bytes) -> list[tuple[str, int]]:
+    """Return one (slide_text, slide_number) entry per PPTX slide."""
+    from pptx import Presentation  # python-pptx
+
+    prs = Presentation(BytesIO(data))
+    result: list[tuple[str, int]] = []
+    for slide_idx, slide in enumerate(prs.slides):
+        texts = []
+        for shape in slide.shapes:
+            if shape.has_text_frame:
+                for para in shape.text_frame.paragraphs:
+                    line = _sanitize_text(para.text.strip())
+                    if line:
+                        texts.append(line)
+        if texts:
+            result.append(("\n".join(texts), slide_idx + 1))
+    return result
+
+
+def _extract_located(file_bytes: bytes, filename: str) -> list[tuple[str, int]]:
+    """Dispatch to a per-page/per-slide extractor based on file extension.
+
+    DOCX and TXT have no page/slide structure so the entire text is returned
+    as a single entry with slide_number = 0 ("position unknown").
+    """
+    ext = ("." + filename.rsplit(".", 1)[-1].lower()) if "." in filename else ""
+    if ext == ".pptx":
+        return _extract_pptx_located(file_bytes)
+    if ext == ".pdf":
+        return _extract_pdf_located(file_bytes)
+    # DOCX / TXT — no positional structure
+    text = extract_text(file_bytes, filename)
+    return [(text, 0)] if text.strip() else []
+
+
+def _chunk_text_located(texts_with_locations: list[tuple[str, int]]) -> list[tuple[str, int]]:
+    """Chunk each (text, location) independently, propagating the location to every chunk."""
+    result: list[tuple[str, int]] = []
+    for text, loc in texts_with_locations:
+        for chunk in _splitter.split_text(text):
+            if len(chunk.strip()) >= MIN_CHUNK_CHARS:
+                result.append((chunk, loc))
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -129,39 +282,29 @@ async def ingest_lesson(
     filename: str = "upload.pdf",
 ) -> int:
     """
-    Parse *file_bytes* (PDF, DOCX, PPTX, or TXT), embed each chunk,
-    and store into lesson_chunks. Returns the number of chunks stored.
+    Parse *file_bytes*, embed all text chunks, and store into lesson_chunks.
+    Returns the number of text chunks stored.
 
-    All chunk embeddings are requested in a single batched call to Ollama,
-    so upload time is one HTTP round-trip regardless of document length.
+    Image description is intentionally NOT done here — it is deferred to
+    ingest_lesson_images() which should be called as a background task after
+    this function returns, so the upload endpoint can respond immediately.
     """
-    text = extract_text(file_bytes, filename)
-    chunks = _chunk_text(text)
-
-    if not chunks:
+    # Located text extraction — each chunk carries its slide/page number
+    located_text_chunks = _chunk_text_located(_extract_located(file_bytes, filename))
+    if not located_text_chunks:
         return 0
 
-    # One batched embed call instead of N sequential calls
-    vectors = await embed_batch(chunks)
+    text_chunks, text_slide_numbers = zip(*located_text_chunks)
+    text_chunks = list(text_chunks)
+    text_slide_numbers = list(text_slide_numbers)
 
-    # Persist content in SQLite (no embedding column) and embeddings in ChromaDB
-    col = lesson_chunks_col()
-    chroma_ids: list[str] = []
-    chroma_embeddings: list[list[float]] = []
-    chroma_documents: list[str] = []
-    chroma_metadatas: list[dict] = []
+    vectors = await embed_batch(text_chunks)
 
-    for i, (chunk_text, vector) in enumerate(zip(chunks, vectors)):
-        chunk = LessonChunk(
-            lesson_id=lesson_id,
-            chunk_index=i,
-            content=chunk_text,
-        )
-        db.add(chunk)
+    for i, chunk_text in enumerate(text_chunks):
+        db.add(LessonChunk(lesson_id=lesson_id, chunk_index=i, content=chunk_text))
 
     await db.flush()
 
-    # Re-query IDs now that flush assigned them
     result = await db.execute(
         select(LessonChunk.id, LessonChunk.content, LessonChunk.chunk_index)
         .where(LessonChunk.lesson_id == lesson_id)
@@ -169,11 +312,21 @@ async def ingest_lesson(
     )
     rows = result.all()
 
+    col = lesson_chunks_col()
+    chroma_ids: list[str] = []
+    chroma_embeddings: list[list[float]] = []
+    chroma_documents: list[str] = []
+    chroma_metadatas: list[dict] = []
+
     for (chunk_id, chunk_content, chunk_index), vector in zip(rows, vectors):
         chroma_ids.append(str(chunk_id))
         chroma_embeddings.append(vector)
         chroma_documents.append(chunk_content)
-        chroma_metadatas.append({"lesson_id": str(lesson_id), "chunk_index": chunk_index})
+        chroma_metadatas.append({
+            "lesson_id": str(lesson_id),
+            "chunk_index": chunk_index,
+            "slide_number": str(text_slide_numbers[chunk_index]),
+        })
 
     col.add(
         ids=chroma_ids,
@@ -182,6 +335,94 @@ async def ingest_lesson(
         metadatas=chroma_metadatas,
     )
 
+    logger.info("lesson_id=%s ingested: %d text chunk(s)", lesson_id, len(rows))
+    return len(rows)
+
+
+async def ingest_lesson_images(
+    lesson_id: int,
+    file_bytes: bytes,
+    filename: str = "upload.pdf",
+    chunk_offset: int = 0,
+) -> int:
+    """
+    Describe images extracted from *file_bytes* using gemma4 vision and add
+    the descriptions as additional chunks in ChromaDB.
+
+    Designed to be called as a background task AFTER ingest_lesson() returns,
+    so the upload endpoint stays fast. chunk_offset should be the number of
+    text chunks already stored (returned by ingest_lesson) so indices don't
+    collide. Uses its own DB session.
+    """
+    from app.core.database import AsyncSessionLocal
+
+    raw_images = _extract_images(file_bytes, filename)
+    if not raw_images:
+        return 0
+
+    image_chunks: list[str] = []
+    image_slide_numbers: list[int] = []
+
+    for location, img_bytes in raw_images:
+        try:
+            img_b64 = base64.b64encode(img_bytes).decode("ascii")
+            description = await describe_image(img_b64)
+            if description:
+                image_chunks.append(description)
+                image_slide_numbers.append(location)
+        except Exception as exc:
+            logger.warning(
+                "lesson_id=%s — image description failed (skipping): %s", lesson_id, exc
+            )
+
+    if not image_chunks:
+        return 0
+
+    vectors = await embed_batch(image_chunks)
+
+    async with AsyncSessionLocal() as db:
+        for i, chunk_text in enumerate(image_chunks):
+            db.add(LessonChunk(
+                lesson_id=lesson_id,
+                chunk_index=chunk_offset + i,
+                content=chunk_text,
+            ))
+        await db.flush()
+
+        result = await db.execute(
+            select(LessonChunk.id, LessonChunk.content, LessonChunk.chunk_index)
+            .where(LessonChunk.lesson_id == lesson_id)
+            .where(LessonChunk.chunk_index >= chunk_offset)
+            .order_by(LessonChunk.chunk_index)
+        )
+        rows = result.all()
+
+        col = lesson_chunks_col()
+        chroma_ids: list[str] = []
+        chroma_embeddings: list[list[float]] = []
+        chroma_documents: list[str] = []
+        chroma_metadatas: list[dict] = []
+
+        for (chunk_id, chunk_content, chunk_index), vector in zip(rows, vectors):
+            chroma_ids.append(str(chunk_id))
+            chroma_embeddings.append(vector)
+            chroma_documents.append(chunk_content)
+            chroma_metadatas.append({
+                "lesson_id": str(lesson_id),
+                "chunk_index": chunk_index,
+                "slide_number": str(image_slide_numbers[chunk_index - chunk_offset]),
+                "source": "image",
+            })
+
+        col.add(
+            ids=chroma_ids,
+            embeddings=chroma_embeddings,
+            documents=chroma_documents,
+            metadatas=chroma_metadatas,
+        )
+        await db.commit()
+
+    logger.info("lesson_id=%s ingested: %d image chunk(s)", lesson_id, len(rows))
     return len(rows)
 
 

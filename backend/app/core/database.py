@@ -9,6 +9,16 @@ engine = create_async_engine(
     connect_args={"check_same_thread": False},
 )
 
+
+async def enable_wal() -> None:
+    """Enable WAL journal mode so concurrent reads never block writes."""
+    from sqlalchemy import text
+    async with engine.connect() as conn:
+        await conn.execute(text("PRAGMA journal_mode=WAL"))
+        await conn.execute(text("PRAGMA synchronous=NORMAL"))
+        await conn.execute(text("PRAGMA busy_timeout=5000"))
+        await conn.commit()
+
 AsyncSessionLocal = async_sessionmaker(
     engine,
     class_=AsyncSession,

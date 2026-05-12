@@ -192,7 +192,7 @@ function LessonsPanel({ teacherId }: { teacherId: number }) {
   const [selectedLessonId, setSelectedLessonId] = useState<number | null>(null);
 
   const load = useCallback(() => {
-    fetch(`${API}/teacher/lessons?teacher_id=${teacherId}`)
+    void fetch(`${API}/teacher/lessons?teacher_id=${teacherId}`)
       .then((r) => r.json())
       .then(setLessons)
       .catch(console.error);
@@ -276,7 +276,7 @@ function LessonsPanel({ teacherId }: { teacherId: number }) {
                 </div>
               </div>
               {l.summary ? (
-                <p className="ll-body" style={{ marginTop: 8, color: "var(--ink-muted)", fontSize: 14 }}>
+                <p className="ll-body" style={{ marginTop: 8, color: "var(--ink-muted)", fontSize: 14, overflow: "hidden", display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical" }}>
                   {l.summary}
                 </p>
               ) : (
@@ -372,7 +372,7 @@ function SessionsPanel({ teacherId }: { teacherId: number }) {
   }, []);
 
   useEffect(() => {
-    fetch(`${API}/teacher/lessons?teacher_id=${teacherId}`)
+    void fetch(`${API}/teacher/lessons?teacher_id=${teacherId}`)
       .then((r) => r.json())
       .then((data: Lesson[]) => {
         setLessons(data);
@@ -430,10 +430,18 @@ function SessionsPanel({ teacherId }: { teacherId: number }) {
       }
     };
 
-    void loadTranscript();
+    let running = false;
+    const safePoll = async () => {
+      if (running || cancelled) return;
+      running = true;
+      await loadTranscript();
+      running = false;
+    };
+
+    void safePoll();
     const intervalId = window.setInterval(() => {
-      void loadTranscript();
-    }, 500);
+      void safePoll();
+    }, 3000);
 
     return () => {
       cancelled = true;
