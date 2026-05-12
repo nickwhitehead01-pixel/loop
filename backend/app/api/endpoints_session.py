@@ -32,6 +32,7 @@ from app.models.schemas import (
 from app.services import ollama_client
 from app.services.chroma_client import transcript_chunks_col
 from app.services.transcription import transcribe_chunk
+from app.services import slide_sync
 
 logger = logging.getLogger(__name__)
 
@@ -165,9 +166,13 @@ async def _generate_and_broadcast_prompt_cards(
         # Previous generation still running — skip rather than queue.
         return
     async with lock:
-        from app.services.prompt_card_service import generate_prompt_cards
+        try:
+            from app.services.prompt_card_service import generate_prompt_cards
 
-        cards = await generate_prompt_cards(bucket_text)
+            cards = await generate_prompt_cards(bucket_text)
+        except Exception as exc:
+            logger.warning("[prompt_cards] generation crashed session=%d: %s", session_id, exc)
+            return
         if not cards:
             return
         _latest_prompt_cards[session_id] = cards
@@ -320,6 +325,9 @@ async def audio_stream(
                 "timestamp_ms": str(bucket_start_ms or 0),
             }],
         )
+        # Infer which slide/page the teacher is on and update shared state.
+        # Awaited inline — adds ~30-50 ms but keeps ordering deterministic.
+        await slide_sync.sync_slide_from_transcript(joined, session_id, db)
         logger.debug(
             "Flushed transcript bucket for session %d: %d utterances / %d words",
             session_id, len(bucket_utterances),
@@ -603,6 +611,13 @@ async def end_session(
     # Clean up prompt-card state for this session
     _prompt_locks.pop(session_id, None)
     _latest_prompt_cards.pop(session_id, None)
+
+    # Clean up tappable-terms state for this session
+    _tappable_locks.pop(session_id, None)
+    _session_tappable_terms.pop(session_id, None)
+
+    # Clean up slide-sync state
+    slide_sync.clear_slide_state(session_id)
 
     # Clean up subscriber connections (both pupils and teacher).
     for sub_dict in (_pupil_subscribers, _teacher_subscribers):

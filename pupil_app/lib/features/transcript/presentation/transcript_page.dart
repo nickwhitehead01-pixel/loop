@@ -90,6 +90,7 @@ class _TranscriptPageState extends State<TranscriptPage> {
   DateTime? _lastChunkAt;
 
   Timer? _waveTimer;
+  Timer? _replyTimeoutTimer;
   WaveformState _waveState = WaveformState.waiting;
 
   @override
@@ -102,7 +103,11 @@ class _TranscriptPageState extends State<TranscriptPage> {
   Future<void> _bootstrap() async {
     await _loadHistory();
     if (!mounted) return;
-    _connectChat();
+    // Only establish the chat connection if the user hasn't already triggered
+    // one by sending a message while history was loading. If _chatSub is
+    // already set, _connectChat() would cancel that live subscription and the
+    // in-flight response tokens would be silently dropped.
+    if (_chatSub == null) _connectChat();
     debugPrint('[TranscriptPage] session ${widget.session.id} isLive=${widget.session.isLive}');
     if (widget.session.isLive) {
       _connectTranscript();
@@ -232,6 +237,7 @@ class _TranscriptPageState extends State<TranscriptPage> {
           if (frame.done && streaming != null) {
             streaming.isStreaming = false;
             _awaitingChatReply = false;
+            _replyTimeoutTimer?.cancel();
           }
         });
         _scrollToBottomSoon();
@@ -307,6 +313,24 @@ class _TranscriptPageState extends State<TranscriptPage> {
       sessionId: widget.session.id,
     );
     _scrollToBottomSoon();
+
+    // Safety timeout: if no {done:true} arrives within 3 minutes, unlock the
+    // Composer so the pupil isn't stuck waiting forever. The model is slow on
+    // CPU; 3 minutes is generous but prevents a permanent UI deadlock.
+    _replyTimeoutTimer?.cancel();
+    _replyTimeoutTimer = Timer(const Duration(minutes: 3), () {
+      if (!mounted) return;
+      final _Entry? streaming = _streamingHelperEntry();
+      if (streaming != null) {
+        setState(() {
+          if (streaming.text.isEmpty) {
+            streaming.text = 'Sorry, the response took too long. Please try again.';
+          }
+          streaming.isStreaming = false;
+          _awaitingChatReply = false;
+        });
+      }
+    });
   }
 
   String _friendlyError(Object error) {
@@ -325,6 +349,7 @@ class _TranscriptPageState extends State<TranscriptPage> {
   @override
   void dispose() {
     _waveTimer?.cancel();
+    _replyTimeoutTimer?.cancel();
     _transcriptSub?.cancel();
     _promptCardSub?.cancel();
     _tappableTermSub?.cancel();

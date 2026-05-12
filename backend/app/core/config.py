@@ -1,12 +1,17 @@
+from pathlib import Path
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Absolute path to the backend/ directory, regardless of cwd at startup.
+_BACKEND_DIR = Path(__file__).resolve().parent.parent.parent
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
+    model_config = SettingsConfigDict(env_file=str(_BACKEND_DIR / ".env"), env_file_encoding="utf-8")
 
-    # Database
-    database_url: str = "sqlite+aiosqlite:///./data/gemma_edu.db"
-    chroma_dir: str = "./data/chroma"
+    # Database — absolute so the path is valid no matter where uvicorn is launched from.
+    database_url: str = f"sqlite+aiosqlite:///{_BACKEND_DIR / 'data' / 'gemma_edu.db'}"
+    chroma_dir: str = str(_BACKEND_DIR / "data" / "chroma")
 
     # Ollama
     ollama_base_url: str = "http://localhost:11434"
@@ -20,7 +25,7 @@ class Settings(BaseSettings):
 
     # App
     debug: bool = False
-    upload_dir: str = "./uploads"
+    upload_dir: str = str(_BACKEND_DIR / "uploads")
 
     # Whisper (speech-to-text)
     whisper_model_size: str = "small"

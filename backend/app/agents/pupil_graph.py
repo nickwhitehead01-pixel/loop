@@ -49,6 +49,7 @@ from app.core.database import AsyncSessionLocal
 from app.models.domain import LessonChunk, Message, MessageRole, PupilMemory, TranscriptChunk
 from app.services import ollama_client
 from app.services import semantic_cache as _sem_cache
+from app.services import slide_sync as _slide_sync
 from app.services.chroma_client import lesson_chunks_col, pupil_memories_col, transcript_chunks_col
 
 logger = logging.getLogger(__name__)
@@ -103,11 +104,21 @@ Be clear, patient, encouraging, and concise.
 Personalise your approach using the pupil facts listed below."""
 
 
-def _build_system_prompt(memories: list[str], context: str) -> str:
+def _build_system_prompt(
+    memories: list[str],
+    context: str,
+    current_slide: "_slide_sync.SlidePosition | None" = None,
+) -> str:
     parts = [_BASE_SYSTEM]
     if memories:
         block = "\n".join(f"- {m}" for m in memories)
         parts.append(f"\nWhat you know about this pupil:\n{block}")
+    if current_slide is not None:
+        parts.append(
+            f"\n[LESSON POSITION]\n"
+            f"The teacher is currently on slide {current_slide.slide_number} "
+            f"of '{current_slide.lesson_title}'."
+        )
     if context:
         parts.append(f"\n[CONTEXT]\n{context}")
     return "\n".join(parts)
@@ -212,16 +223,32 @@ async def run_pupil_agent(
         get_conversation_history_func(conversation_id, db),
     )
 
+    # Resolve which lesson is active for this session so context retrieval can
+    # be scoped to that lesson's chunks only. Without this, the vector search
+    # ranks chunks from ALL uploaded lessons and may return content from a
+    # completely different lesson if it's semantically closer to the query.
+    active_lesson_id: int | None = None
+    if session_id is not None:
+        from app.models.domain import Lesson as _Lesson
+        lesson_result = await db.execute(
+            select(_Lesson.id).where(_Lesson.session_id == session_id)
+        )
+        active_lesson_id = lesson_result.scalar_one_or_none()
+
     context = ""
     try:
         if tool_name == "retrieve_context":
             # Pass shared vector directly — no second embed call
             col = lesson_chunks_col()
-            results = col.query(
-                query_embeddings=[shared_vector],
-                n_results=3,
-                include=["documents"],
-            )
+            query_kwargs: dict = {
+                "query_embeddings": [shared_vector],
+                "n_results": 3,
+                "include": ["documents"],
+            }
+            # Scope to the active lesson when we know which one it is.
+            if active_lesson_id is not None:
+                query_kwargs["where"] = {"lesson_id": str(active_lesson_id)}
+            results = col.query(**query_kwargs)
             rows = (results.get("documents") or [[]])[0]
             context = "\n\n---\n\n".join(rows) if rows else ""
         elif tool_name == "search_transcript":
@@ -250,7 +277,11 @@ async def run_pupil_agent(
     except Exception:
         logger.exception("Retrieval failed for tool %s — continuing without context", tool_name)
 
-    system_prompt = _build_system_prompt(prior_memories, context)
+    system_prompt = _build_system_prompt(
+        prior_memories,
+        context,
+        current_slide=_slide_sync.get_current_slide(session_id) if session_id else None,
+    )
 
     # --- Build message list (history already fetched in gather above) ---
     recent = history[:-1][-6:]

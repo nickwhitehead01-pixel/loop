@@ -6,6 +6,7 @@ Uses the 'small' model (~1GB RAM) for best balance on 16GB machines.
 """
 from __future__ import annotations
 
+import asyncio
 import io
 import logging
 from typing import NamedTuple
@@ -38,15 +39,13 @@ def get_model() -> WhisperModel:
     return _model
 
 
-async def transcribe_chunk(audio_bytes: bytes) -> TranscriptionResult:
+def _transcribe_sync(audio_bytes: bytes) -> TranscriptionResult:
     """
-    Transcribe a chunk of audio (WAV/WebM/raw PCM).
+    Blocking transcription — runs the full faster-whisper pipeline synchronously.
 
-    Args:
-        audio_bytes: Raw audio data (any format ffmpeg can decode).
-
-    Returns:
-        TranscriptionResult with text and detected language.
+    Must be called via asyncio.to_thread() to avoid blocking the event loop.
+    The generator returned by model.transcribe() is consumed here, inside the
+    thread, so the event loop is never occupied during CPU inference.
     """
     model = get_model()
     segments, info = model.transcribe(
@@ -59,5 +58,24 @@ async def transcribe_chunk(audio_bytes: bytes) -> TranscriptionResult:
         vad_filter=False,
         no_speech_threshold=0.45,
     )
+    # Consume the lazy generator fully within this thread so CPU work never
+    # spills back onto the asyncio event loop.
     text = " ".join(seg.text.strip() for seg in segments).strip()
     return TranscriptionResult(text=text, language=info.language or "en")
+
+
+async def transcribe_chunk(audio_bytes: bytes) -> TranscriptionResult:
+    """
+    Transcribe a chunk of audio (WAV/WebM/raw PCM).
+
+    Runs faster-whisper in a thread-pool worker via asyncio.to_thread so the
+    CPU-bound inference never blocks the event loop. All network I/O (WebSocket
+    broadcasts, DB writes) continues uninterrupted while transcription runs.
+
+    Args:
+        audio_bytes: Raw audio data (any format ffmpeg can decode).
+
+    Returns:
+        TranscriptionResult with text and detected language.
+    """
+    return await asyncio.to_thread(_transcribe_sync, audio_bytes)

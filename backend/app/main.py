@@ -13,7 +13,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.config import settings
-from app.core.database import Base, engine, AsyncSessionLocal
+from app.core.database import Base, engine, AsyncSessionLocal, enable_wal
 from app.services import ollama_client
 from app.services.chroma_client import init_collections
 from app.services.lesson_summary_worker import start_summary_worker
@@ -47,6 +47,10 @@ async def _seed_default_users() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup: create tables + verify Ollama. Shutdown: close HTTP client."""
+    # Enable WAL mode before any queries (reads never block writes)
+    await enable_wal()
+    logger.info("SQLite WAL mode enabled")
+
     # Create all tables (idempotent)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)

@@ -17,8 +17,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.models.domain import LessonChunk
+import asyncio
+
 from app.services import ollama_client
-from app.services.vector_store import ingest_lesson
+from app.services.vector_store import ingest_lesson, ingest_lesson_images
 
 logger = logging.getLogger(__name__)
 
@@ -26,10 +28,15 @@ logger = logging.getLogger(__name__)
 # System prompts
 # ---------------------------------------------------------------------------
 
-_CHUNK_SUMMARY_SYSTEM = """You are a concise educational assistant.
-Given a passage from a lesson document, write EXACTLY 2 sentences that capture
-the most important idea in this passage. Be direct and clear — suitable for a
-teacher who wants a quick overview. Do not add headings or bullet points."""
+_LESSON_SUMMARY_SYSTEM = """You are an expert educational assistant.
+Read the provided excerpts from a lesson plan. Write a single, cohesive paragraph (exactly 3 to 4 sentences) summarizing the lesson for a teacher's dashboard.
+
+RULES:
+1. State the core mathematical or educational concept being taught.
+2. Briefly describe the main activity or method the students will use (e.g., drawing tables, finding patterns).
+3. DO NOT repeat yourself.
+4. DO NOT mention copyright, licensing, or the Oak National Academy.
+5. Write standard paragraph text only. No bullet points, no headings."""
 
 
 # ---------------------------------------------------------------------------
@@ -43,10 +50,18 @@ async def process_lesson(
     filename: str = "upload.pdf",
 ) -> int:
     """
-    Parse *pdf_bytes* (PDF, DOCX, PPTX, or TXT), embed all 500/50-token chunks,
-    and store them in lesson_chunks. Returns the number of chunks created.
+    Parse *pdf_bytes* (PDF, DOCX, PPTX, or TXT), embed all 500/50-token text chunks,
+    and store them in lesson_chunks. Returns the number of text chunks created.
+
+    Image description is fired as a background asyncio task so the upload
+    endpoint returns immediately after text ingestion completes.
     """
-    return await ingest_lesson(lesson_id, pdf_bytes, db, filename=filename)
+    n_text = await ingest_lesson(lesson_id, pdf_bytes, db, filename=filename)
+    # Fire image description in the background — never blocks the upload response
+    asyncio.create_task(
+        ingest_lesson_images(lesson_id, pdf_bytes, filename=filename, chunk_offset=n_text)
+    )
+    return n_text
 
 
 async def summarise_lesson(
@@ -54,11 +69,9 @@ async def summarise_lesson(
     db: AsyncSession,
 ) -> str:
     """
-    Iterate over every chunk for *lesson_id* in order, ask gemma4:e2b for a
-    2-sentence summary of each chunk, then concatenate into a full lesson summary.
-
-    Keeping each Gemma call small (one 500-token chunk at a time) avoids
-    hitting the context window on memory-constrained hardware.
+    Summarise a lesson with a single Gemma call using skeleton sampling.
+    Grabs the intro, evenly spaced middle sections, and the conclusion,
+    ensuring the AI sees the core content while keeping the prompt under the token limit.
     """
     result = await db.execute(
         select(LessonChunk.content)
@@ -70,25 +83,34 @@ async def summarise_lesson(
     if not chunks:
         return "No content found for this lesson."
 
-    mini_summaries: list[str] = []
-    for i, chunk_text in enumerate(chunks):
-        try:
-            messages = [{"role": "user", "content": f"Passage:\n\n{chunk_text}"}]
-            mini = await ollama_client.generate_full(
-                messages=messages,
-                model=settings.ollama_model_teacher,
-                system=_CHUNK_SUMMARY_SYSTEM,
-            )
-            if mini and mini.strip():
-                mini_summaries.append(mini.strip())
-        except Exception:
-            logger.warning(
-                "Chunk summary failed for lesson %d chunk %d — skipping",
-                lesson_id, i,
-            )
+    total = len(chunks)
 
-    if not mini_summaries:
+    # Skeleton sampling: intro + learning objectives + two middle points + penultimate slide
+    if total <= 4:
+        parts = list(chunks)
+    else:
+        parts = [
+            chunks[0],                      # Title / Intro
+            chunks[1],                      # Usually Learning Objectives
+            chunks[total // 3],             # 33% through the lesson
+            chunks[(total * 2) // 3],       # 66% through the lesson
+            chunks[-2],                     # Second to last (avoids copyright slide at -1)
+        ]
+
+    skeleton_text = "\n...\n".join(parts)
+
+    # Hard cap to guard against unusually large chunks
+    safe_text = skeleton_text[:8_000]
+
+    try:
+        messages = [{"role": "user", "content": f"Lesson excerpts:\n\n{safe_text}"}]
+        summary = await ollama_client.generate_full(
+            messages=messages,
+            model=settings.ollama_model_teacher,
+            system=_LESSON_SUMMARY_SYSTEM,
+        )
+        return summary.strip() if summary and summary.strip() else "Summary generation failed."
+    except Exception:
+        logger.warning("summarise_lesson failed for lesson %d", lesson_id)
         return "Summary generation failed."
-
-    return "\n\n".join(mini_summaries)
 

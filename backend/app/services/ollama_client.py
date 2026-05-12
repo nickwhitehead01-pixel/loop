@@ -20,7 +20,12 @@ _client: httpx.AsyncClient | None = None
 def get_client() -> httpx.AsyncClient:
     global _client
     if _client is None or _client.is_closed:
-        _client = httpx.AsyncClient(base_url=settings.ollama_base_url, timeout=120)
+        # No read timeout — LLM inference on local hardware can be slow.
+        # Short connect/pool timeouts so we still fail fast if Ollama is down.
+        _client = httpx.AsyncClient(
+            base_url=settings.ollama_base_url,
+            timeout=httpx.Timeout(connect=10.0, read=None, write=None, pool=10.0),
+        )
     return _client
 
 
@@ -126,4 +131,39 @@ async def generate_full(
     async for token in generate_stream(messages, model, system, format=format):
         tokens.append(token)
     return "".join(tokens)
+
+
+# ---------------------------------------------------------------------------
+# Vision — image description via gemma4 multimodal
+# ---------------------------------------------------------------------------
+
+async def describe_image(image_b64: str) -> str:
+    """
+    Use gemma4's vision capability to produce a rich text description of a
+    base64-encoded image extracted from an uploaded lesson document.
+
+    Per Ollama/Gemma4 best practices, image content is placed before the text
+    prompt in the message payload for optimal multimodal performance.
+
+    Returns the description string, or an empty string if the model returns nothing.
+    """
+    payload = {
+        "model": settings.ollama_model_teacher,
+        "messages": [
+            {
+                "role": "user",
+                # Image is declared in "images" list; Gemma4 processes it before the text.
+                "content": (
+                    "Describe this image in detail for educational indexing purposes. "
+                    "Include all visible text, diagram labels, chart values, equations, "
+                    "figures, and key visual concepts. Be thorough and specific."
+                ),
+                "images": [image_b64],
+            }
+        ],
+        "stream": False,
+    }
+    r = await get_client().post("/api/chat", json=payload, timeout=120)
+    r.raise_for_status()
+    return r.json().get("message", {}).get("content", "").strip()
 
