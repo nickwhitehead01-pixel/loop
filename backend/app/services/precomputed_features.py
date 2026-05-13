@@ -56,18 +56,40 @@ _GLOSSARY_PROMPT = (
     "Friendly tone, no jargon, no condescension, no \"this means\" filler.\n\n"
     "Lesson content:\n"
     "---\n{content}\n---\n\n"
-    "Reply with ONLY a JSON array, each element of the form "
-    '{{"term": "...", "explanation": "..."}}. No commentary, no markdown.'
+    "Reply with ONLY a JSON object of the form "
+    '{{"terms": [{{"term": "...", "explanation": "..."}}, ...]}}. '
+    "No commentary, no markdown."
 )
 
 
-def _parse_json_array(raw: str) -> list:
-    """Extract the first JSON array from *raw*, tolerating stray text."""
-    start = raw.find("[")
-    end = raw.rfind("]") + 1
-    if start == -1 or end <= start:
-        raise ValueError("No JSON array found in LLM response")
-    return json.loads(raw[start:end])
+def _parse_list(raw: str, *, primary_key: str | None = None) -> list:
+    """Pull a list out of *raw*, tolerating the shapes Gemma actually returns.
+
+    Under Ollama's ``format="json"`` the top-level value is forced to be a
+    JSON object, so we usually get ``{"terms": [...]}`` or similar — but
+    we also tolerate a bare array (in case format mode is dropped), and a
+    dict with the array under any key (in case Gemma renames it).
+    """
+    # Strip stray prose around the JSON if the model decided to be chatty.
+    obj_start = raw.find("{")
+    arr_start = raw.find("[")
+    if obj_start == -1 and arr_start == -1:
+        raise ValueError("No JSON in LLM response")
+    # Whichever opens first is the top-level shape.
+    if arr_start != -1 and (obj_start == -1 or arr_start < obj_start):
+        end = raw.rfind("]") + 1
+        return json.loads(raw[arr_start:end])
+    end = raw.rfind("}") + 1
+    parsed = json.loads(raw[obj_start:end])
+    if not isinstance(parsed, dict):
+        raise ValueError("Expected dict at top level, got %r" % type(parsed).__name__)
+    if primary_key and isinstance(parsed.get(primary_key), list):
+        return parsed[primary_key]
+    # Last-resort: take the first list-valued field.
+    for value in parsed.values():
+        if isinstance(value, list):
+            return value
+    raise ValueError(f"No list found in object (keys: {list(parsed.keys())})")
 
 
 async def generate_glossary(lesson_content: str) -> list[dict]:
@@ -86,15 +108,24 @@ async def generate_glossary(lesson_content: str) -> list[dict]:
         model=settings.ollama_model_teacher,
         format="json",
     )
-    parsed = _parse_json_array(raw)
+    parsed = _parse_list(raw, primary_key="terms")
+    # Dedupe by lowercased term — Gemma frequently lists the same term two or
+    # three times when it spans multiple paragraphs of the source material.
+    # First occurrence wins so the most carefully-written explanation is kept.
+    seen: set[str] = set()
     cleaned: list[dict] = []
     for item in parsed:
         if not isinstance(item, dict):
             continue
         term = str(item.get("term", "")).strip()
         explanation = str(item.get("explanation", "")).strip()
-        if term and explanation:
-            cleaned.append({"term": term, "explanation": explanation})
+        if not term or not explanation:
+            continue
+        key = term.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append({"term": term, "explanation": explanation})
     # Trim to upper bound in case Gemma went over.
     return cleaned[: _TARGET_GLOSSARY_SIZE[1]]
 
@@ -119,8 +150,8 @@ _PROMPT_CARDS_PROMPT = (
     "\"why\" and \"how\" questions.\n\n"
     "Lesson content:\n"
     "---\n{content}\n---\n\n"
-    "Reply with ONLY a JSON array. Each element: "
-    '{{"question": "...", "triggers": ["...", "..."]}}. '
+    "Reply with ONLY a JSON object of the form "
+    '{{"cards": [{{"question": "...", "triggers": ["...", "..."]}}, ...]}}. '
     "No commentary, no markdown."
 )
 
@@ -143,7 +174,7 @@ async def generate_prompt_card_library(lesson_content: str) -> list[dict]:
         model=settings.ollama_model_teacher,
         format="json",
     )
-    parsed = _parse_json_array(raw)
+    parsed = _parse_list(raw, primary_key="cards")
 
     cards: list[dict] = []
     for idx, item in enumerate(parsed[: _TARGET_PROMPT_CARD_COUNT[1]]):
