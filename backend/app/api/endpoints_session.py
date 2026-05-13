@@ -64,6 +64,31 @@ _tappable_locks: dict[int, asyncio.Lock] = {}
 _session_tappable_terms: dict[int, dict[str, dict]] = {}
 
 
+# ── Per-session live-feature flags ──────────────────────────────────────────
+#
+# Teachers can opt into the heavier Gemma-backed features (prompt cards,
+# tappable terms) on a session-by-session basis. Both default to OFF so a
+# single-machine demo doesn't grind transcription to a halt: each fires
+# its own Gemma call every ~60s of speech, which on consumer hardware
+# competes hard with Whisper inference for CPU and RAM.
+#
+# Stored in memory keyed by session id — survives until the backend
+# restarts, which is fine for a hackathon. If we ever wanted persistence
+# across restarts these'd live on the LessonSession row.
+
+DEFAULT_SESSION_FEATURES: dict[str, bool] = {
+    "prompt_cards": False,
+    "tappable_terms": False,
+}
+
+_session_features: dict[int, dict[str, bool]] = {}
+
+
+def get_session_features(session_id: int) -> dict[str, bool]:
+    """Return the current feature-flag map for a session, defaulted if unset."""
+    return _session_features.setdefault(session_id, dict(DEFAULT_SESSION_FEATURES))
+
+
 def _get_subscribers(session_id: int) -> set[WebSocket]:
     return _pupil_subscribers.setdefault(session_id, set())
 
@@ -163,7 +188,12 @@ async def _generate_and_broadcast_prompt_cards(
     """Generate prompt cards for *bucket_text* and push to all subscribers."""
     lock = _prompt_locks.setdefault(session_id, asyncio.Lock())
     if lock.locked():
-        # Previous generation still running — skip rather than queue.
+        # Previous Gemma call still running — skip rather than queue, but log
+        # it so persistent silence is observable in the backend output.
+        logger.warning(
+            "[prompt_cards] skip session=%d (previous Gemma call still in flight)",
+            session_id,
+        )
         return
     async with lock:
         try:
@@ -174,10 +204,15 @@ async def _generate_and_broadcast_prompt_cards(
             logger.warning("[prompt_cards] generation crashed session=%d: %s", session_id, exc)
             return
         if not cards:
+            logger.warning("[prompt_cards] no cards returned session=%d", session_id)
             return
         _latest_prompt_cards[session_id] = cards
         payload = {"type": "prompt_cards", "cards": cards}
         subscribers = _get_subscribers(session_id)
+        logger.warning(
+            "[prompt_cards] broadcast session=%d subscribers=%d cards=%d",
+            session_id, len(subscribers), len(cards),
+        )
         dead: list[WebSocket] = []
         for ws in subscribers:
             try:
@@ -416,9 +451,10 @@ async def audio_stream(
             ):
                 flushed_text = await flush_bucket()
                 if flushed_text:
-                    asyncio.create_task(
-                        _generate_and_broadcast_prompt_cards(session_id, flushed_text)
-                    )
+                    if get_session_features(session_id).get("prompt_cards"):
+                        asyncio.create_task(
+                            _generate_and_broadcast_prompt_cards(session_id, flushed_text)
+                        )
                     # Bucket flush already covers the recent speech; reset
                     # the card-utterance accumulator to avoid double-firing.
                     card_utterances.clear()
@@ -426,7 +462,10 @@ async def audio_stream(
 
             # ── Prompt-card interval trigger ───────────────────────────
             card_utterances.append(result.text)
-            if len(card_utterances) >= _CARD_INTERVAL:
+            if (
+                len(card_utterances) >= _CARD_INTERVAL
+                and get_session_features(session_id).get("prompt_cards")
+            ):
                 card_text = " ".join(card_utterances)
                 card_utterances.clear()
                 asyncio.create_task(
@@ -577,6 +616,47 @@ async def subscribe_teacher(
 
 
 # ---------------------------------------------------------------------------
+# GET / PATCH /session/{session_id}/features — live-feature toggles
+# ---------------------------------------------------------------------------
+
+from pydantic import BaseModel  # local import keeps top-of-file tidy
+
+
+class SessionFeaturesUpdate(BaseModel):
+    """Partial update — only fields the teacher actually flipped are sent."""
+    prompt_cards: bool | None = None
+    tappable_terms: bool | None = None
+
+
+@router.get("/{session_id}/features")
+async def read_session_features(session_id: int) -> dict[str, bool]:
+    """Return the current feature-flag map for *session_id*.
+
+    No DB lookup — the flags live in memory and the session is implicitly
+    valid if it has been used to open the transcription stream.
+    """
+    return get_session_features(session_id)
+
+
+@router.patch("/{session_id}/features")
+async def update_session_features(
+    session_id: int,
+    body: SessionFeaturesUpdate,
+) -> dict[str, bool]:
+    """Flip one or both flags. Returns the new full state for confirmation.
+
+    The transcription handler reads these on every Gemma-firing tick, so the
+    change takes effect within ~one chunk without restarting the session.
+    """
+    features = get_session_features(session_id)
+    if body.prompt_cards is not None:
+        features["prompt_cards"] = body.prompt_cards
+    if body.tappable_terms is not None:
+        features["tappable_terms"] = body.tappable_terms
+    return features
+
+
+# ---------------------------------------------------------------------------
 # POST /session/{session_id}/end
 # ---------------------------------------------------------------------------
 
@@ -611,6 +691,7 @@ async def end_session(
     # Clean up prompt-card state for this session
     _prompt_locks.pop(session_id, None)
     _latest_prompt_cards.pop(session_id, None)
+    _session_features.pop(session_id, None)
 
     # Clean up tappable-terms state for this session
     _tappable_locks.pop(session_id, None)

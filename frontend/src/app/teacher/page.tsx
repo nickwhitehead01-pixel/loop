@@ -6,6 +6,7 @@ import StudentProgress from "@/components/StudentProgress";
 import TeacherChat from "@/components/TeacherChat";
 import ConfirmDialog from "@/components/ConfirmDialog";
 import QuizPanel from "@/components/QuizPanel";
+import LiveFeaturesPanel from "@/components/LiveFeaturesPanel";
 
 const TEACHER_ID = 1;
 const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
@@ -932,6 +933,11 @@ function SessionsPanel({ teacherId }: { teacherId: number }) {
           <p className="ll-body" style={{ color: "var(--error)" }}>{sessionError}</p>
         )}
       </div>
+
+      {/* Live-feature toggles — both Gemma-backed features default off on the
+          backend so transcription stays snappy. Shown above the quiz so the
+          teacher sees the perf escape hatch before they start asking questions. */}
+      {activeSession && <LiveFeaturesPanel sessionId={activeSession.id} />}
 
       {/* Quiz controls — only meaningful once the session is open and pupils
           are in the room. Mounting unconditionally on activeSession means the
