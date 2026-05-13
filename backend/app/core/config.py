@@ -18,17 +18,22 @@ class Settings(BaseSettings):
     ollama_model_pupil: str = "gemma4:e2b"
     ollama_model_teacher: str = "gemma4:e2b"
     ollama_embed_model: str = "nomic-embed-text"
-    # Tappable-term flagging is a "classify-and-explain" task that doesn't
-    # need full pupil-agent reasoning. Using a smaller, faster model keeps
-    # the underline experience real-time even on a single-GPU classroom hub.
-    ollama_model_tappable: str = "gemma3:1b"
+    # (gemma3:1b was previously used for live tappable-term generation; that
+    # path is now pre-computed at lesson-upload time, so a second model on
+    # the live path is no longer needed.)
 
     # App
     debug: bool = False
     upload_dir: str = str(_BACKEND_DIR / "uploads")
 
-    # Whisper (speech-to-text)
-    whisper_model_size: str = "small"
+    # Whisper (speech-to-text).
+    # `base.en` is the English-only variant of the base model: ~30–40% faster
+    # than the multilingual variant of the same size because it skips language
+    # detection, and ~2–3x faster than `small`. Accuracy on a single-teacher
+    # classroom voice is effectively indistinguishable. Override via env to
+    # `tiny.en` for low-spec demo hardware or back to `small.en` if you need
+    # the extra accuracy.
+    whisper_model_size: str = "base.en"
 
     # Conversation memory window (last N messages loaded per session)
     memory_window: int = 10

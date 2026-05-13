@@ -302,17 +302,34 @@ async def list_lessons(
     result = await db.execute(query)
     lessons = result.scalars().all()
 
-    # Attach file counts
     if lessons:
         ids = [l.id for l in lessons]
-        counts_result = await db.execute(
+
+        # File counts
+        file_counts_result = await db.execute(
             select(LF.lesson_id, sa_func.count(LF.id).label("cnt"))
             .where(LF.lesson_id.in_(ids))
             .group_by(LF.lesson_id)
         )
-        count_map = {row.lesson_id: row.cnt for row in counts_result}
+        file_counts = {row.lesson_id: row.cnt for row in file_counts_result}
+
+        # Chunk counts — the existence (or not) of any chunk is what tells
+        # the UI we've moved out of the "reading file" stage.
+        chunk_counts_result = await db.execute(
+            select(LessonChunk.lesson_id, sa_func.count(LessonChunk.id).label("cnt"))
+            .where(LessonChunk.lesson_id.in_(ids))
+            .group_by(LessonChunk.lesson_id)
+        )
+        chunk_counts = {row.lesson_id: row.cnt for row in chunk_counts_result}
+
+        # Populate everything the response model expects. Glossary and
+        # prompt-card counts come from the JSON columns directly — they're
+        # small bounded lists so len() is cheap.
         for lesson in lessons:
-            lesson.file_count = count_map.get(lesson.id, 1)  # type: ignore[attr-defined]
+            lesson.file_count = file_counts.get(lesson.id, 1)  # type: ignore[attr-defined]
+            lesson.chunk_count = chunk_counts.get(lesson.id, 0)  # type: ignore[attr-defined]
+            lesson.glossary_count = len(lesson.glossary or [])  # type: ignore[attr-defined]
+            lesson.prompt_card_count = len(lesson.prompt_cards or [])  # type: ignore[attr-defined]
 
     return lessons
 
@@ -355,6 +372,17 @@ async def get_lesson_detail(
     )
     chunks = [{"id": row.id, "content": row.content} for row in chunks_result]
 
+    # Strip embeddings from the prompt-card payload — they're large (768
+    # floats × ~12 cards = ~10KB) and the detail view doesn't need them.
+    # Triggers stay so the UI can show what makes each card surface.
+    prompt_cards_preview = []
+    for card in (lesson.prompt_cards or []):
+        if not isinstance(card, dict):
+            continue
+        prompt_cards_preview.append({
+            k: v for k, v in card.items() if k != "trigger_embedding"
+        })
+
     return {
         "id": lesson.id,
         "title": lesson.title,
@@ -374,7 +402,46 @@ async def get_lesson_detail(
         ],
         "chunks": chunks,
         "chunk_count": len(chunks),
+        # Pre-computed live-feature data for the detail page to render.
+        # The list endpoint only returns counts; here we return the full
+        # glossary so the teacher can preview it, and the prompt cards
+        # minus their embeddings (which are needed for matching, not display).
+        "glossary": lesson.glossary or [],
+        "prompt_cards": prompt_cards_preview,
+        "glossary_count": len(lesson.glossary or []),
+        "prompt_card_count": len(prompt_cards_preview),
+        "precomputed_features_at": lesson.precomputed_features_at,
+        "precomputed_features_attempts": lesson.precomputed_features_attempts,
     }
+
+
+@router.post("/lessons/{lesson_id}/regenerate-features", status_code=202)
+async def regenerate_lesson_features(
+    lesson_id: int,
+    db: AsyncSession = Depends(get_db),
+):
+    """Clear the pre-computed glossary and prompt cards so the background
+    worker re-generates them on its next poll cycle.
+
+    Used when the teacher wants to retry after tweaking the source material
+    or after a precompute failure exhausted its retries. The endpoint
+    returns immediately with 202 Accepted; the UI's polling will pick up
+    the regenerated fields when they land (usually within 10s + Gemma's
+    generation time).
+    """
+    result = await db.execute(select(Lesson).where(Lesson.id == lesson_id))
+    lesson = result.scalar_one_or_none()
+    if not lesson:
+        raise HTTPException(status_code=404, detail="Lesson not found")
+    # Drop the precompute outputs and reset the attempt counter so the
+    # worker treats this as a fresh job. We keep the summary — that
+    # doesn't need regenerating just to refresh the glossary.
+    lesson.glossary = None
+    lesson.prompt_cards = None
+    lesson.precomputed_features_at = None
+    lesson.precomputed_features_attempts = 0
+    await db.commit()
+    return {"status": "queued"}
 
 
 @router.delete("/lessons/{lesson_id}", status_code=204)
@@ -754,8 +821,28 @@ async def teacher_transcribe(
 
     # Prompt-card accumulator — fires _generate_and_broadcast_prompt_cards every
     # _TEACHER_CARD_INTERVAL utterances so pupils see context-aware suggestions.
-    _TEACHER_CARD_INTERVAL = 5
+    #
+    # Two competing pressures:
+    #   - Bigger window = each call has more context but more input tokens to
+    #     read, which on consumer hardware means a noticeable Gemma stall.
+    #   - Smaller window = each call is much quicker (Gemma latency is
+    #     dominated by input tokens) and the result reflects what was JUST
+    #     said, which is what pupils actually want for live prompt cards.
+    #
+    # 4 lands in the sweet spot: each batch covers ~12-16s of speech (with
+    # MAX_CHUNK=4s) — small enough that Gemma turns it round fast, large
+    # enough that the topic doesn't disappear between batches. The card
+    # utterance buffer is cleared after each fire so each call really does
+    # only see the new window, not a growing scrollback.
+    _TEACHER_CARD_INTERVAL = 3
     card_utterances: list[str] = []
+    # Counter used to alternate which of the two LLM-backed features runs on
+    # each tick. Firing both concurrently doubles up Gemma RAM/CPU pressure
+    # and the second call usually loses to the per-session "skip if busy"
+    # lock anyway, so it's invisible work. Alternating means each feature
+    # fires every other tick (≈ every 24s of speech with interval=3) and
+    # only one Gemma call is ever in flight at a time.
+    _llm_tick = 0
 
     async def maybe_rationalize() -> None:
         nonlocal raw_buffer, rationalize_in_flight
@@ -844,16 +931,33 @@ async def teacher_transcribe(
                             from app.api.endpoints_session import (  # noqa: PLC0415
                                 _generate_and_broadcast_prompt_cards,
                                 _generate_and_broadcast_tappable_terms,
+                                get_session_features,
                             )
-                            asyncio.create_task(
-                                _generate_and_broadcast_prompt_cards(session_id, card_text)
-                            )
-                            # Fire-and-forget tappable terms in parallel — one
-                            # extra Gemma call per batch, same skip-if-busy
-                            # lock prevents pile-ups during fast speech.
-                            asyncio.create_task(
-                                _generate_and_broadcast_tappable_terms(session_id, card_text)
-                            )
+                            features = get_session_features(session_id)
+                            # Alternate which feature runs on each tick so
+                            # only one Gemma call is ever in flight. Within
+                            # each branch we still respect the teacher's
+                            # feature flag — if the flag is off we just skip,
+                            # we don't fall through to the other feature.
+                            _llm_tick += 1
+                            if _llm_tick % 2 == 1:
+                                if features.get("prompt_cards"):
+                                    logger.info(
+                                        "[live-features] session=%d firing prompt_cards (tick=%d, words=%d)",
+                                        session_id, _llm_tick, len(card_text.split()),
+                                    )
+                                    asyncio.create_task(
+                                        _generate_and_broadcast_prompt_cards(session_id, card_text)
+                                    )
+                            else:
+                                if features.get("tappable_terms"):
+                                    logger.info(
+                                        "[live-features] session=%d firing tappable_terms (tick=%d, words=%d)",
+                                        session_id, _llm_tick, len(card_text.split()),
+                                    )
+                                    asyncio.create_task(
+                                        _generate_and_broadcast_tappable_terms(session_id, card_text)
+                                    )
 
                         # Buffer raw chunks and rationalize in small serialized batches.
                         raw_buffer.append(emit_text)

@@ -6,6 +6,8 @@ import StudentProgress from "@/components/StudentProgress";
 import TeacherChat from "@/components/TeacherChat";
 import ConfirmDialog from "@/components/ConfirmDialog";
 import QuizPanel from "@/components/QuizPanel";
+import LessonProcessingStatus from "@/components/LessonProcessingStatus";
+import LiveFeaturesPanel from "@/components/LiveFeaturesPanel";
 
 const TEACHER_ID = 1;
 const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
@@ -20,6 +22,13 @@ interface Lesson {
   created_at: string;
   summary: string | null;
   file_count: number;
+  // Pre-lesson processing fields used by LessonProcessingStatus to derive
+  // the current stage. Backend populates them in /teacher/lessons.
+  chunk_count: number;
+  glossary_count: number;
+  prompt_card_count: number;
+  precomputed_features_at: string | null;
+  precomputed_features_attempts: number;
 }
 
 interface SessionInfo {
@@ -38,12 +47,28 @@ type WaveState = "paused" | "waiting" | "listening" | "error";
 
 const WAVE_BAR_COUNT = 32;
 const IDLE_WAVE = Array.from({ length: WAVE_BAR_COUNT }, (_, idx) => 0.1 + ((idx % 5) * 0.025));
-const TRANSCRIBE_MIN_CHUNK_SECONDS = 0.6;
-const TRANSCRIBE_MAX_CHUNK_SECONDS = 6;
+// VAD timings tuned for "snappy" responsiveness over absolute accuracy.
+// A chunk flushes when EITHER (a) we've accumulated >= MIN seconds AND seen
+// >= SILENCE_HOLD seconds of silence, or (b) we've hit MAX seconds regardless.
+// So minimum end-to-end latency from sentence end → server ≈ SILENCE_HOLD.
+// Dropping MIN/SILENCE_HOLD from the old 0.6/0.35 to 0.4/0.2 trims ~0.35s
+// off perceived latency; the cost is slightly less context per Whisper call,
+// which is fine for a single clear teacher voice but would hurt in a noisy
+// room. Bump them back up if accuracy regresses.
+const TRANSCRIBE_MIN_CHUNK_SECONDS = 0.4;
+// Upper bound on a single audio chunk. There's a real trade-off here:
+//   - Higher values let Whisper land on natural silence boundaries → more
+//     accurate, but a teacher talking continuously sees a wall of text.
+//   - Lower values cap the worst-case latency, but a forced mid-utterance
+//     cut makes Whisper duplicate or drop the words straddling the boundary.
+// 4s is a middle ground: a teacher who pauses naturally will hit the
+// silence-based flush first (so accuracy is fine), and continuous speech
+// chunks at 4s — still snappy, fewer broken-word artifacts than at 2s.
+const TRANSCRIBE_MAX_CHUNK_SECONDS = 4;
 const TRANSCRIBE_MIN_RMS = 0.0015;
 const TRANSCRIBE_VOICE_ON_RMS = 0.003;
 const TRANSCRIBE_VOICE_OFF_RMS = 0.002;
-const TRANSCRIBE_SILENCE_HOLD_SECONDS = 0.35;
+const TRANSCRIBE_SILENCE_HOLD_SECONDS = 0.2;
 
 function writeWavHeader(view: DataView, sampleCount: number, sampleRate: number) {
   const writeString = (offset: number, value: string) => {
@@ -173,6 +198,52 @@ function WaveformCard({ state, levels }: { state: WaveState; levels: number[] })
   );
 }
 
+// ── Word-by-word reveal ─────────────────────────────────────────────────────
+// Used on the most-recently-arrived transcript line so it streams in rather
+// than appearing as a block. Each word gets an animation-delay so they fade
+// in sequentially. Only animates on mount (stable key on the parent line
+// keeps the same spans from remounting), so once a line has settled it
+// stays still even when new lines arrive after it.
+function StreamingWords({ text }: { text: string }) {
+  // Split on whitespace but preserve the spacing in the output so we don't
+  // collapse multiple-space pauses or strip leading/trailing whitespace.
+  const tokens = text.split(/(\s+)/);
+
+  // Spread the reveal across roughly the chunk-collection window. Whisper
+  // returns whole chunks at intervals, so once one finishes animating there's
+  // dead time until the next arrives — animating *across* that window means
+  // words appear continuously instead of in bursts followed by silence.
+  // Clamped per-word so short chunks don't take forever and very long ones
+  // don't overflow into the next chunk's reveal.
+  const wordCount = tokens.filter((t) => !/^\s+$/.test(t)).length || 1;
+  const TARGET_TOTAL_MS = 2400;
+  const MIN_PER_WORD_MS = 90;
+  const MAX_PER_WORD_MS = 260;
+  const PER_WORD_MS = Math.max(
+    MIN_PER_WORD_MS,
+    Math.min(MAX_PER_WORD_MS, Math.round(TARGET_TOTAL_MS / wordCount)),
+  );
+  let wordIdx = 0;
+  return (
+    <>
+      {tokens.map((tok, i) => {
+        if (/^\s+$/.test(tok)) return <span key={i}>{tok}</span>;
+        const delay = wordIdx * PER_WORD_MS;
+        wordIdx += 1;
+        return (
+          <span
+            key={i}
+            className="ll-word"
+            style={{ animationDelay: `${delay}ms` }}
+          >
+            {tok}
+          </span>
+        );
+      })}
+    </>
+  );
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function formatDate(iso: string | null) {
   if (!iso) return "—";
@@ -200,9 +271,18 @@ function LessonsPanel({ teacherId }: { teacherId: number }) {
 
   useEffect(() => { load(); }, [load]);
 
-  // Poll every 8 s while any lesson is still pending background analysis
+  // Poll every 8 s while any lesson is still mid-pipeline. "Mid-pipeline"
+  // now means EITHER summary is null OR precompute hasn't finished and
+  // hasn't given up — so we keep refreshing through both worker stages,
+  // not just the summary step.
   useEffect(() => {
-    const hasPending = lessons.some((l) => l.summary === null);
+    const PRECOMPUTE_MAX_ATTEMPTS = 5;
+    const hasPending = lessons.some(
+      (l) =>
+        l.summary === null ||
+        (!l.precomputed_features_at &&
+          l.precomputed_features_attempts < PRECOMPUTE_MAX_ATTEMPTS),
+    );
     if (!hasPending) return;
     const id = setInterval(load, 8000);
     return () => clearInterval(id);
@@ -275,21 +355,18 @@ function LessonsPanel({ teacherId }: { teacherId: number }) {
                   </button>
                 </div>
               </div>
-              {l.summary ? (
+              {l.summary && (
                 <p className="ll-body" style={{ marginTop: 8, color: "var(--ink-muted)", fontSize: 14, overflow: "hidden", display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical" }}>
                   {l.summary}
                 </p>
-              ) : (
-                <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 10 }}>
-                  <svg width="13" height="13" viewBox="0 0 13 13" style={{ flexShrink: 0, animation: "ll-spin 1.1s linear infinite" }} aria-hidden="true">
-                    <circle cx="6.5" cy="6.5" r="5" fill="none" stroke="var(--ink-soft)" strokeWidth="2" />
-                    <path d="M6.5 1.5 A5 5 0 0 1 11.5 6.5" fill="none" stroke="var(--action)" strokeWidth="2" strokeLinecap="round" />
-                  </svg>
-                  <p style={{ fontSize: 13, color: "var(--ink-muted)", fontFamily: "var(--font-sans)" }}>
-                    AI analysis in progress — check back in a few minutes
-                  </p>
-                </div>
               )}
+              {/* Step indicator. Once the summary is showing, the indicator
+                  drops below it and continues to track precompute progress;
+                  before the summary it stands alone in place of the body
+                  text. Hidden when everything's done so the row goes quiet. */}
+              <div style={{ marginTop: l.summary ? 8 : 10 }}>
+                <LessonProcessingStatus lesson={l} hideWhenReady />
+              </div>
             </div>
           ))}
         </div>
@@ -856,7 +933,7 @@ function SessionsPanel({ teacherId }: { teacherId: number }) {
                       fontStyle: isRationalized ? "italic" : "normal",
                     }}
                   >
-                    {displayLine}
+                    {isLatest ? <StreamingWords text={displayLine} /> : displayLine}
                   </p>
                 </div>
                 );
@@ -870,6 +947,11 @@ function SessionsPanel({ teacherId }: { teacherId: number }) {
           <p className="ll-body" style={{ color: "var(--error)" }}>{sessionError}</p>
         )}
       </div>
+
+      {/* Live-feature toggles — both Gemma-backed features default off on the
+          backend so transcription stays snappy. Shown above the quiz so the
+          teacher sees the perf escape hatch before they start asking questions. */}
+      {activeSession && <LiveFeaturesPanel sessionId={activeSession.id} />}
 
       {/* Quiz controls — only meaningful once the session is open and pupils
           are in the room. Mounting unconditionally on activeSession means the

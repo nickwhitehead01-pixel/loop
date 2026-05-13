@@ -1,7 +1,12 @@
 "use client";
 import { useCallback, useEffect, useState } from "react";
+import LessonProcessingStatus, { deriveLessonStage } from "./LessonProcessingStatus";
 
 const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
+
+// Must match PRECOMPUTE_MAX_ATTEMPTS in lesson_summary_worker.py — see the
+// note in LessonProcessingStatus.tsx.
+const PRECOMPUTE_MAX_ATTEMPTS = 5;
 
 interface LessonFile {
   id: number;
@@ -15,6 +20,18 @@ interface Chunk {
   content: string;
 }
 
+interface GlossaryEntry {
+  term: string;
+  explanation: string;
+}
+
+interface PromptCardPreview {
+  id?: string;
+  question: string;
+  color: string;
+  triggers?: string[];
+}
+
 interface LessonDetailData {
   id: number;
   title: string;
@@ -23,6 +40,16 @@ interface LessonDetailData {
   files: LessonFile[];
   chunks: Chunk[];
   chunk_count: number;
+  // Pre-computed live-lesson features. Each is null/empty until the
+  // background worker has run; the LessonProcessingStatus component
+  // reads precomputed_features_at / precomputed_features_attempts to
+  // pick the right stage label.
+  glossary: GlossaryEntry[];
+  prompt_cards: PromptCardPreview[];
+  glossary_count: number;
+  prompt_card_count: number;
+  precomputed_features_at: string | null;
+  precomputed_features_attempts: number;
 }
 
 interface Props {
@@ -236,6 +263,20 @@ export default function LessonDetail({ lessonId, onBack }: Props) {
 
   useEffect(() => { load(); }, [load]);
 
+  // Re-fetch every 8s while any worker stage is still pending. We stop
+  // polling once everything's done (or precompute has given up), so the
+  // detail page goes quiet when nothing more is going to change.
+  useEffect(() => {
+    if (!data) return;
+    const pending =
+      data.summary == null ||
+      (!data.precomputed_features_at &&
+        data.precomputed_features_attempts < PRECOMPUTE_MAX_ATTEMPTS);
+    if (!pending) return;
+    const id = window.setInterval(load, 8000);
+    return () => window.clearInterval(id);
+  }, [data, load]);
+
   const copyLink = (f: LessonFile) => {
     const url = `${API}${f.url}`;
     navigator.clipboard.writeText(url).then(() => {
@@ -403,16 +444,36 @@ export default function LessonDetail({ lessonId, onBack }: Props) {
               />
             )}
           </div>
+          {/* Processing status banner. Hidden once everything is ready
+              so the page doesn't carry a permanent "Ready" badge. */}
+          {deriveLessonStage(data) !== "ready" && (
+            <div
+              className="ll-card"
+              style={{
+                background: "var(--paper-shade)",
+                display: "flex",
+                alignItems: "center",
+                gap: 12,
+              }}
+            >
+              <LessonProcessingStatus lesson={data} textColor="var(--ink)" />
+            </div>
+          )}
+
           <div className="ll-card">
             <p className="ll-label" style={{ marginBottom: 10 }}>AI summary</p>
             {data.summary ? (
               <SummaryBlock text={data.summary} />
             ) : (
               <p style={{ fontSize: 14, color: "var(--ink-muted)" }}>
-                No summary available — the AI may not have been able to read the content yet.
+                Summary is being generated — this should appear in a couple of minutes.
               </p>
             )}
           </div>
+
+          {/* Live-lesson features. Shows progress while the worker is
+              still building them, or previews once they're ready. */}
+          <LiveFeaturesSection data={data} onChange={setData} />
 
           {/* Indexed passages */}
           <div className="ll-card">
@@ -477,4 +538,225 @@ export default function LessonDetail({ lessonId, onBack }: Props) {
       )}
     </div>
   );
+}
+
+/**
+ * Renders the pre-computed glossary and prompt-card library produced by the
+ * background worker. Each sub-section shows one of:
+ *   - a spinner ("Preparing…") while the worker is still running
+ *   - the actual entries once they're ready
+ *   - a warning if the worker has given up
+ *
+ * Kept inside this file because it shares the LessonDetailData shape with
+ * the main component — splitting it would just mean re-declaring the
+ * GlossaryEntry / PromptCardPreview types.
+ */
+function LiveFeaturesSection({
+  data,
+  onChange,
+}: {
+  data: LessonDetailData;
+  /** Called with an updated LessonDetailData to optimistically refresh the
+   *  parent's state without waiting for the next poll. */
+  onChange: (next: LessonDetailData) => void;
+}) {
+  const [regenerating, setRegenerating] = useState(false);
+  const stage = deriveLessonStage(data);
+  // Don't render anything while we're still earlier than the precompute
+  // stage — the user gets the processing banner instead. Once we reach
+  // preparing/ready/failed we have something useful to say here.
+  if (stage === "reading" || stage === "summarising") return null;
+
+  const regenerate = async () => {
+    setRegenerating(true);
+    // Optimistic local update — flip into "preparing" stage IMMEDIATELY so
+    // the user sees the spinner the instant they click, rather than waiting
+    // up to 8s for the next poll tick. The polling effect in the parent
+    // page only starts ticking once the data is in a pending state, so
+    // without this the page would look frozen until manual refresh.
+    onChange({
+      ...data,
+      glossary: [],
+      prompt_cards: [],
+      glossary_count: 0,
+      prompt_card_count: 0,
+      precomputed_features_at: null,
+      precomputed_features_attempts: 0,
+    });
+    try {
+      await fetch(`${API}/teacher/lessons/${data.id}/regenerate-features`, {
+        method: "POST",
+      });
+    } finally {
+      setRegenerating(false);
+    }
+  };
+
+  // Allow regenerate whenever there's something to regenerate FROM (i.e.
+  // we're not mid-precompute already). The teacher usually hits this when
+  // the auto-generated list missed words they care about, or after the
+  // 5-attempt failure state.
+  const canRegenerate = stage === "ready" || stage === "features_failed";
+
+  return (
+    <div className="ll-card">
+      <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 16, marginBottom: 4 }}>
+        <p className="ll-label">Live-lesson features</p>
+        {canRegenerate && (
+          <button
+            onClick={regenerate}
+            disabled={regenerating}
+            style={{
+              background: "none",
+              border: "1px solid var(--ink-soft)",
+              borderRadius: "var(--radius-sm)",
+              padding: "4px 10px",
+              fontSize: 12,
+              fontFamily: "var(--font-sans)",
+              color: regenerating ? "var(--ink-muted)" : "var(--ink)",
+              cursor: regenerating ? "wait" : "pointer",
+            }}
+            title="Re-run the AI analysis to refresh the glossary and prompt cards. Takes a few minutes."
+          >
+            {regenerating ? "Queued…" : "Regenerate"}
+          </button>
+        )}
+      </div>
+      <p style={{ fontSize: 13, color: "var(--ink-muted)", marginBottom: 14 }}>
+        Pupils see these during the lesson: tappable words for tricky vocabulary,
+        and prompt cards suggesting questions they could ask.
+      </p>
+
+      <FeatureSubsection
+        title="Tappable words"
+        emptyHint={data.glossary_count === 0
+          ? "Gemma is picking the trickiest terms from your material — usually 15-25 words."
+          : null}
+        stage={stage}
+      >
+        {data.glossary.length > 0 && (
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+            {data.glossary.map((g, i) => (
+              <span
+                key={i}
+                title={g.explanation}
+                style={{
+                  background: "var(--paper-shade)",
+                  color: "var(--ink)",
+                  fontSize: 12,
+                  fontFamily: "var(--font-sans)",
+                  padding: "4px 10px",
+                  borderRadius: 999,
+                  cursor: "help",
+                  border: "1px solid var(--ink-soft)",
+                }}
+              >
+                {g.term}
+              </span>
+            ))}
+          </div>
+        )}
+      </FeatureSubsection>
+
+      <div style={{ height: 16 }} />
+
+      <FeatureSubsection
+        title="Prompt cards"
+        emptyHint={data.prompt_card_count === 0
+          ? "Gemma is drafting questions a pupil might naturally ask while you teach this."
+          : null}
+        stage={stage}
+      >
+        {data.prompt_cards.length > 0 && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            {data.prompt_cards.map((c, i) => (
+              <div
+                key={c.id ?? i}
+                style={{
+                  padding: "10px 14px",
+                  background: "var(--paper-shade)",
+                  borderRadius: "var(--radius-sm)",
+                  border: "1px solid var(--ink-soft)",
+                  borderLeft: `3px solid ${cardColor(c.color)}`,
+                }}
+              >
+                <p style={{ fontSize: 14, color: "var(--ink)", marginBottom: 4 }}>
+                  {c.question}
+                </p>
+                {c.triggers && c.triggers.length > 0 && (
+                  <p style={{ fontSize: 11, color: "var(--ink-muted)", fontFamily: "var(--font-sans)" }}>
+                    surfaces on: {c.triggers.join(", ")}
+                  </p>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+      </FeatureSubsection>
+    </div>
+  );
+}
+
+function FeatureSubsection({
+  title,
+  emptyHint,
+  stage,
+  children,
+}: {
+  title: string;
+  emptyHint: string | null;
+  stage: ReturnType<typeof deriveLessonStage>;
+  children: React.ReactNode;
+}) {
+  const isPreparing = stage === "preparing_features";
+  const isFailed = stage === "features_failed";
+  return (
+    <div>
+      <p
+        className="ll-label"
+        style={{ marginBottom: 8, color: "var(--ink)" }}
+      >
+        {title}
+      </p>
+      {/* Show the children (the actual content) if we have any, otherwise
+          show a spinner / hint / failure message. */}
+      {children ? <div>{children}</div> : null}
+      {!children && isPreparing && emptyHint && (
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <svg
+            width="13"
+            height="13"
+            viewBox="0 0 13 13"
+            style={{ flexShrink: 0, animation: "ll-spin 1.1s linear infinite" }}
+            aria-hidden="true"
+          >
+            <circle cx="6.5" cy="6.5" r="5" fill="none" stroke="var(--ink-soft)" strokeWidth="2" />
+            <path d="M6.5 1.5 A5 5 0 0 1 11.5 6.5" fill="none" stroke="var(--action)" strokeWidth="2" strokeLinecap="round" />
+          </svg>
+          <p style={{ fontSize: 13, color: "var(--ink-muted)" }}>{emptyHint}</p>
+        </div>
+      )}
+      {!children && isFailed && (
+        <p style={{ fontSize: 13, color: "var(--warn)" }}>
+          Couldn't generate {title.toLowerCase()} after five attempts. The lesson
+          will still work — pupils just won't see this feature.
+        </p>
+      )}
+    </div>
+  );
+}
+
+function cardColor(color: string): string {
+  // Map the backend's named palette ("blue" / "green" / "amber") to the
+  // existing design-system tokens. Falls back to action blue for unknown
+  // values so a new colour wouldn't render as invisible.
+  switch (color) {
+    case "green":
+      return "var(--success)";
+    case "amber":
+      return "var(--warn)";
+    case "blue":
+    default:
+      return "var(--action)";
+  }
 }

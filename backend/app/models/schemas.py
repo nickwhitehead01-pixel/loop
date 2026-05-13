@@ -49,6 +49,14 @@ class LessonResponse(BaseModel):
     summary: str | None = None
     summary_generated_at: datetime | None = None
     created_at: datetime
+    # Processing state — surfaced so the UI can show a step-by-step
+    # status indicator instead of a single "in progress" spinner that
+    # disappears the moment the summary lands.
+    chunk_count: int = 0
+    glossary_count: int = 0
+    prompt_card_count: int = 0
+    precomputed_features_at: datetime | None = None
+    precomputed_features_attempts: int = 0
 
 
 # ── Chat ───────────────────────────────────────────────────────────────────

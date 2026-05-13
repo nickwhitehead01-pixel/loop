@@ -26,6 +26,19 @@
 	<string>$(FLUTTER_BUILD_NUMBER)</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
+	<!-- The Hub serves over plain HTTP on the school LAN by design (air-gapped
+	     classroom, no certs). NSAllowsLocalNetworking is narrower than
+	     NSAllowsArbitraryLoads — it permits cleartext only to local/loopback
+	     addresses, which is exactly the school-Wi-Fi case. -->
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
+	<!-- iOS 14+ blocks local-network traffic until the user grants permission.
+	     Without this string the OS silently fails connection attempts. -->
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Pupil App connects to the classroom Hub on your school's local Wi-Fi to receive the live lesson.</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

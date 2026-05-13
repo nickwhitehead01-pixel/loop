@@ -33,6 +33,7 @@ from app.services import ollama_client
 from app.services.chroma_client import transcript_chunks_col
 from app.services.transcription import transcribe_chunk
 from app.services import slide_sync
+from app.services.live_matcher import match_prompt_cards, match_tappable_terms
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +64,44 @@ _tappable_locks: dict[int, asyncio.Lock] = {}
 # so they don't have to wait for a fresh batch before seeing dotted underlines.
 _session_tappable_terms: dict[int, dict[str, dict]] = {}
 
+# Per-session cache of (glossary, prompt_card_library) for the lesson linked
+# to the session. Loaded lazily on first match; we DO NOT hit the DB on every
+# transcript chunk. Cleared when the session ends.
+_session_lesson_features: dict[int, tuple[list, list]] = {}
+
+# Per-session rolling window of recently-broadcast prompt-card ids, used to
+# prevent the same card from re-firing in consecutive batches. Length 4 ≈
+# one minute of cooldown at the current bucket cadence — long enough that
+# the variety on screen stays fresh, short enough that the small library
+# can recycle without going silent.
+from collections import deque  # local import keeps top-of-file tidy
+_session_recent_card_ids: dict[int, deque] = {}
+
+
+# ── Per-session live-feature flags ──────────────────────────────────────────
+#
+# Teachers can opt into the heavier Gemma-backed features (prompt cards,
+# tappable terms) on a session-by-session basis. Both default to OFF so a
+# single-machine demo doesn't grind transcription to a halt: each fires
+# its own Gemma call every ~60s of speech, which on consumer hardware
+# competes hard with Whisper inference for CPU and RAM.
+#
+# Stored in memory keyed by session id — survives until the backend
+# restarts, which is fine for a hackathon. If we ever wanted persistence
+# across restarts these'd live on the LessonSession row.
+
+DEFAULT_SESSION_FEATURES: dict[str, bool] = {
+    "prompt_cards": False,
+    "tappable_terms": False,
+}
+
+_session_features: dict[int, dict[str, bool]] = {}
+
+
+def get_session_features(session_id: int) -> dict[str, bool]:
+    """Return the current feature-flag map for a session, defaulted if unset."""
+    return _session_features.setdefault(session_id, dict(DEFAULT_SESSION_FEATURES))
+
 
 def _get_subscribers(session_id: int) -> set[WebSocket]:
     return _pupil_subscribers.setdefault(session_id, set())
@@ -75,9 +114,11 @@ def _get_teacher_subscribers(session_id: int) -> set[WebSocket]:
 async def _broadcast(subscribers: set[WebSocket], payload: dict) -> None:
     """Send *payload* to every WS in *subscribers*, dropping dead connections.
 
-    Shared helper so the per-event broadcast functions don't each reinvent the
-    dead-WS cleanup loop. Safe against modification during iteration because
-    we build the dead list separately.
+    Shared by every broadcaster in this module (matchers + the public
+    broadcast_to_pupils/broadcast_to_teacher helpers below) so each one
+    doesn't reinvent the dead-WS cleanup loop. Iteration is safe against
+    concurrent modification because dead sockets go into a separate list
+    before being discarded.
     """
     dead: list[WebSocket] = []
     for ws in subscribers:
@@ -107,85 +148,136 @@ async def broadcast_to_teacher(session_id: int, payload: dict) -> None:
     await _broadcast(_get_teacher_subscribers(session_id), payload)
 
 
-async def _generate_and_broadcast_tappable_terms(
-    session_id: int, bucket_text: str
-) -> None:
-    """Generate tappable terms for *bucket_text* and push to all subscribers.
+async def _get_lesson_features(session_id: int) -> tuple[list, list]:
+    """Return ``(glossary, prompt_card_library)`` for the lesson tied to this
+    session, cached after first SUCCESSFUL load.
 
-    Cumulative on the server: new terms are merged into the per-session map
-    so a pupil who joined mid-lesson can still see every term that's been
-    flagged so far (sent on subscribe via the late-join path below).
+    Lazy-loads from SQLite. Critically, we only cache when the lesson has
+    actual precomputed data — empty results (worker hasn't finished yet,
+    or all retries exhausted) are NOT cached. Otherwise a teacher who
+    opens a session early would be stuck with empty features for the
+    whole lesson even after regen completes.
+
+    Cost of re-querying SQLite on every transcript chunk is negligible
+    compared to the work the matcher is about to do.
     """
-    logger.warning(
-        "[tappable] entry session=%d bucket_words=%d",
-        session_id, len(bucket_text.split()),
-    )
-    lock = _tappable_locks.setdefault(session_id, asyncio.Lock())
-    if lock.locked():
-        logger.warning("[tappable] skip session=%d (lock busy)", session_id)
-        return
-    async with lock:
-        try:
-            from app.services.tappable_terms_service import generate_tappable_terms
+    cached = _session_lesson_features.get(session_id)
+    if cached is not None:
+        return cached
 
-            new_terms = await generate_tappable_terms(bucket_text)
-        except Exception as exc:
-            logger.exception("[tappable] generation crashed: %s", exc)
-            return
-        if not new_terms:
-            logger.warning("[tappable] no terms returned session=%d", session_id)
-            return
-        store = _session_tappable_terms.setdefault(session_id, {})
-        for entry in new_terms:
-            store[entry["term"].lower()] = entry
-        payload = {"type": "tappable_terms", "terms": new_terms}
-        subscribers = _get_subscribers(session_id)
-        logger.warning(
-            "[tappable] broadcast session=%d subscribers=%d terms=%d",
-            session_id, len(subscribers), len(new_terms),
+    # Local import to avoid pulling AsyncSessionLocal into this module's top
+    # level; the DB session is short-lived and ephemeral.
+    from app.core.database import AsyncSessionLocal
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(
+            select(Lesson.glossary, Lesson.prompt_cards)
+            .where(Lesson.session_id == session_id)
         )
-        dead: list[WebSocket] = []
-        for ws in subscribers:
-            try:
-                await ws.send_json(payload)
-            except Exception as send_err:
-                logger.warning(
-                    "[tappable] send failed session=%d: %s", session_id, send_err,
-                )
-                dead.append(ws)
-        for ws in dead:
-            subscribers.discard(ws)
+        row = result.one_or_none()
+    glossary = (row[0] or []) if row else []
+    prompt_cards = (row[1] or []) if row else []
+
+    # Only memoise once we have something to remember. An empty result is
+    # treated as transient — next call will re-check the DB. This costs us
+    # one extra SELECT per chunk while precompute is still running, then
+    # zero forever once the lesson is fully prepared.
+    if glossary or prompt_cards:
+        _session_lesson_features[session_id] = (glossary, prompt_cards)
+        logger.warning(
+            "[matcher] session=%d lesson features now loaded "
+            "(%d glossary, %d cards)",
+            session_id, len(glossary), len(prompt_cards),
+        )
+    return glossary, prompt_cards
 
 
-async def _generate_and_broadcast_prompt_cards(
+async def _match_and_broadcast_tappable_terms(
     session_id: int, bucket_text: str
 ) -> None:
-    """Generate prompt cards for *bucket_text* and push to all subscribers."""
-    lock = _prompt_locks.setdefault(session_id, asyncio.Lock())
-    if lock.locked():
-        # Previous generation still running — skip rather than queue.
-        return
-    async with lock:
-        try:
-            from app.services.prompt_card_service import generate_prompt_cards
+    """Match the lesson glossary against *bucket_text* and broadcast any
+    newly-seen terms to all pupil subscribers, gated by the teacher's
+    per-session feature flag.
 
-            cards = await generate_prompt_cards(bucket_text)
-        except Exception as exc:
-            logger.warning("[prompt_cards] generation crashed session=%d: %s", session_id, exc)
-            return
-        if not cards:
-            return
-        _latest_prompt_cards[session_id] = cards
-        payload = {"type": "prompt_cards", "cards": cards}
-        subscribers = _get_subscribers(session_id)
-        dead: list[WebSocket] = []
-        for ws in subscribers:
-            try:
-                await ws.send_json(payload)
-            except Exception:
-                dead.append(ws)
-        for ws in dead:
-            subscribers.discard(ws)
+    Cumulative on the server: the per-session ``_session_tappable_terms``
+    map remembers everything we've broadcast already so late-joining
+    pupils can be sent the full set, and so a term the teacher repeats
+    later doesn't generate a second "tappable_terms" event.
+    """
+    if not get_session_features(session_id).get("tappable_terms"):
+        return
+    glossary, _ = await _get_lesson_features(session_id)
+    if not glossary:
+        return
+    matches = match_tappable_terms(bucket_text, glossary)
+    if not matches:
+        return
+
+    store = _session_tappable_terms.setdefault(session_id, {})
+    new_terms = []
+    for entry in matches:
+        key = entry["term"].lower()
+        if key in store:
+            continue  # already broadcast earlier in this session
+        store[key] = entry
+        new_terms.append(entry)
+    if not new_terms:
+        return
+
+    payload = {"type": "tappable_terms", "terms": new_terms}
+    subscribers = _get_subscribers(session_id)
+    # WARNING level so it actually shows up under uvicorn's default config —
+    # INFO gets dropped, and silence makes "are matchers firing?" impossible
+    # to answer from the log alone. The volume here is naturally bounded
+    # (each term broadcasts at most once per session).
+    logger.warning(
+        "[tappable] broadcast session=%d subscribers=%d new_terms=%d: %s",
+        session_id, len(subscribers), len(new_terms),
+        [t["term"] for t in new_terms],
+    )
+    await _broadcast(subscribers, payload)
+
+
+async def _match_and_broadcast_prompt_cards(
+    session_id: int, bucket_text: str
+) -> None:
+    """Semantic-match against the lesson's pre-computed prompt-card library
+    and broadcast the top hits, with a per-session cooldown so the same
+    card doesn't fire two batches in a row. Gated by the teacher's flag.
+    """
+    if not get_session_features(session_id).get("prompt_cards"):
+        return
+    _, prompt_card_library = await _get_lesson_features(session_id)
+    if not prompt_card_library:
+        return
+
+    recent_ids = _session_recent_card_ids.setdefault(session_id, deque(maxlen=4))
+    cards = await match_prompt_cards(
+        bucket_text,
+        prompt_card_library,
+        recently_shown_ids=set(recent_ids),
+    )
+    if not cards:
+        return
+
+    for card in cards:
+        recent_ids.append(card["id"])
+
+    _latest_prompt_cards[session_id] = cards
+    payload = {"type": "prompt_cards", "cards": cards}
+    subscribers = _get_subscribers(session_id)
+    logger.warning(
+        "[prompt_cards] broadcast session=%d subscribers=%d cards=%d: %s",
+        session_id, len(subscribers), len(cards),
+        [c["text"] for c in cards],
+    )
+    await _broadcast(subscribers, payload)
+
+
+# Back-compat aliases so existing callers in endpoints_teacher.py (and the
+# legacy /session/ws/{id}/audio path below) don't need to be touched.
+# These names will go away in a follow-up cleanup.
+_generate_and_broadcast_tappable_terms = _match_and_broadcast_tappable_terms
+_generate_and_broadcast_prompt_cards = _match_and_broadcast_prompt_cards
 
 
 # ---------------------------------------------------------------------------
@@ -416,9 +508,10 @@ async def audio_stream(
             ):
                 flushed_text = await flush_bucket()
                 if flushed_text:
-                    asyncio.create_task(
-                        _generate_and_broadcast_prompt_cards(session_id, flushed_text)
-                    )
+                    if get_session_features(session_id).get("prompt_cards"):
+                        asyncio.create_task(
+                            _generate_and_broadcast_prompt_cards(session_id, flushed_text)
+                        )
                     # Bucket flush already covers the recent speech; reset
                     # the card-utterance accumulator to avoid double-firing.
                     card_utterances.clear()
@@ -426,7 +519,10 @@ async def audio_stream(
 
             # ── Prompt-card interval trigger ───────────────────────────
             card_utterances.append(result.text)
-            if len(card_utterances) >= _CARD_INTERVAL:
+            if (
+                len(card_utterances) >= _CARD_INTERVAL
+                and get_session_features(session_id).get("prompt_cards")
+            ):
                 card_text = " ".join(card_utterances)
                 card_utterances.clear()
                 asyncio.create_task(
@@ -577,6 +673,47 @@ async def subscribe_teacher(
 
 
 # ---------------------------------------------------------------------------
+# GET / PATCH /session/{session_id}/features — live-feature toggles
+# ---------------------------------------------------------------------------
+
+from pydantic import BaseModel  # local import keeps top-of-file tidy
+
+
+class SessionFeaturesUpdate(BaseModel):
+    """Partial update — only fields the teacher actually flipped are sent."""
+    prompt_cards: bool | None = None
+    tappable_terms: bool | None = None
+
+
+@router.get("/{session_id}/features")
+async def read_session_features(session_id: int) -> dict[str, bool]:
+    """Return the current feature-flag map for *session_id*.
+
+    No DB lookup — the flags live in memory and the session is implicitly
+    valid if it has been used to open the transcription stream.
+    """
+    return get_session_features(session_id)
+
+
+@router.patch("/{session_id}/features")
+async def update_session_features(
+    session_id: int,
+    body: SessionFeaturesUpdate,
+) -> dict[str, bool]:
+    """Flip one or both flags. Returns the new full state for confirmation.
+
+    The transcription handler reads these on every Gemma-firing tick, so the
+    change takes effect within ~one chunk without restarting the session.
+    """
+    features = get_session_features(session_id)
+    if body.prompt_cards is not None:
+        features["prompt_cards"] = body.prompt_cards
+    if body.tappable_terms is not None:
+        features["tappable_terms"] = body.tappable_terms
+    return features
+
+
+# ---------------------------------------------------------------------------
 # POST /session/{session_id}/end
 # ---------------------------------------------------------------------------
 
@@ -611,10 +748,15 @@ async def end_session(
     # Clean up prompt-card state for this session
     _prompt_locks.pop(session_id, None)
     _latest_prompt_cards.pop(session_id, None)
+    _session_features.pop(session_id, None)
 
     # Clean up tappable-terms state for this session
     _tappable_locks.pop(session_id, None)
     _session_tappable_terms.pop(session_id, None)
+
+    # Clean up live-matcher state for this session
+    _session_lesson_features.pop(session_id, None)
+    _session_recent_card_ids.pop(session_id, None)
 
     # Clean up slide-sync state
     slide_sync.clear_slide_state(session_id)
