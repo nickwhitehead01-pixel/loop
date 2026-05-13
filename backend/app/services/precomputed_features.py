@@ -30,11 +30,12 @@ logger = logging.getLogger(__name__)
 # live-generator used, so the pupil UI sees a consistent palette.
 _COLORS = ["blue", "green", "amber"]
 
-# Caps on the size of each precomputed asset. The numbers come from what
-# was useful in the live generators (which produced ~3 cards / 5 terms per
-# bucket); for a whole-lesson precompute we want a richer library to draw
-# matches from, but not so large the matcher slows down.
-_TARGET_GLOSSARY_SIZE = (15, 25)        # min, max — soft targets in the prompt
+# Caps on the size of each precomputed asset. We deliberately ask for a
+# generous glossary because teachers consistently report that *what an
+# adult considers obvious* trips up 11-year-olds (especially those with
+# SEN). Better to flag a word the pupil already knows than miss one they
+# don't — they can just ignore the underline.
+_TARGET_GLOSSARY_SIZE = (30, 50)        # min, max — soft targets in the prompt
 _TARGET_PROMPT_CARD_COUNT = (8, 12)
 
 
@@ -43,17 +44,25 @@ _TARGET_PROMPT_CARD_COUNT = (8, 12)
 # ---------------------------------------------------------------------------
 
 _GLOSSARY_PROMPT = (
-    "You are preparing pupil-facing study aids from a lesson document.\n"
-    "Read the lesson content below and pick the {min}-{max} terms that an "
-    "11-15 year old (some with special educational needs) is most likely to "
-    "need explained when they encounter them in the live lesson. Prefer:\n"
-    "- domain-specific or technical terms\n"
-    "- unusual or vivid verbs/adjectives that carry meaning\n"
+    "You are preparing pupil-facing study aids from a lesson document. "
+    "Your readers are 11-15 year olds, some with special educational needs. "
+    "Their vocabulary is narrower than an adult's — words you might call "
+    "'everyday' can still trip them up.\n\n"
+    "Pick {min}-{max} words and short phrases from the lesson content that "
+    "any pupil in this age group MIGHT need explained. When in doubt, "
+    "INCLUDE the term — pupils can ignore an underline they don't need, "
+    "but they can't ask about an explanation that isn't there. Cast a wide "
+    "net:\n"
+    "- domain-specific or technical terms (the obvious ones)\n"
+    "- unusual verbs and adjectives ('absorb', 'combine', 'release')\n"
+    "- abstract nouns ('source', 'process', 'equation', 'energy')\n"
     "- proper nouns of historical/cultural significance\n"
-    "- concepts the pupil may not have met yet\n\n"
-    "Skip everyday words and anything obvious from surrounding context.\n\n"
+    "- compound words or short phrases that act like single concepts\n"
+    "- words a teacher would casually use but a pupil might not have met\n\n"
+    "Only skip words that a 6-year-old would already know cold.\n\n"
     "For each term, write a one- or two-sentence plain-language explanation. "
-    "Friendly tone, no jargon, no condescension, no \"this means\" filler.\n\n"
+    "Friendly tone, no jargon, no condescension, no \"this means\" filler. "
+    "Imagine you're explaining to a curious 10-year-old sitting next to you.\n\n"
     "Lesson content:\n"
     "---\n{content}\n---\n\n"
     "Reply with ONLY a JSON object of the form "

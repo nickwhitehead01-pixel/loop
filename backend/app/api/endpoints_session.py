@@ -140,18 +140,23 @@ async def broadcast_to_teacher(session_id: int, payload: dict) -> None:
 
 async def _get_lesson_features(session_id: int) -> tuple[list, list]:
     """Return ``(glossary, prompt_card_library)`` for the lesson tied to this
-    session, cached after first load.
+    session, cached after first SUCCESSFUL load.
 
-    Lazy-loads from SQLite on first call per session. If the lesson hasn't
-    been precomputed yet (worker hasn't run, or it failed all retries) both
-    lists come back empty — the matchers degrade to no-op cleanly.
+    Lazy-loads from SQLite. Critically, we only cache when the lesson has
+    actual precomputed data — empty results (worker hasn't finished yet,
+    or all retries exhausted) are NOT cached. Otherwise a teacher who
+    opens a session early would be stuck with empty features for the
+    whole lesson even after regen completes.
+
+    Cost of re-querying SQLite on every transcript chunk is negligible
+    compared to the work the matcher is about to do.
     """
     cached = _session_lesson_features.get(session_id)
     if cached is not None:
         return cached
 
     # Local import to avoid pulling AsyncSessionLocal into this module's top
-    # level; this is also a one-shot per session so the small cost is fine.
+    # level; the DB session is short-lived and ephemeral.
     from app.core.database import AsyncSessionLocal
     async with AsyncSessionLocal() as db:
         result = await db.execute(
@@ -159,18 +164,21 @@ async def _get_lesson_features(session_id: int) -> tuple[list, list]:
             .where(Lesson.session_id == session_id)
         )
         row = result.one_or_none()
-    features = (
-        (row[0] or []) if row else [],
-        (row[1] or []) if row else [],
-    )
-    _session_lesson_features[session_id] = features
-    if not features[0] and not features[1]:
-        logger.info(
-            "[matcher] session=%d has no precomputed features yet — pupils "
-            "see no underlines or cards until the worker catches up.",
-            session_id,
+    glossary = (row[0] or []) if row else []
+    prompt_cards = (row[1] or []) if row else []
+
+    # Only memoise once we have something to remember. An empty result is
+    # treated as transient — next call will re-check the DB. This costs us
+    # one extra SELECT per chunk while precompute is still running, then
+    # zero forever once the lesson is fully prepared.
+    if glossary or prompt_cards:
+        _session_lesson_features[session_id] = (glossary, prompt_cards)
+        logger.warning(
+            "[matcher] session=%d lesson features now loaded "
+            "(%d glossary, %d cards)",
+            session_id, len(glossary), len(prompt_cards),
         )
-    return features
+    return glossary, prompt_cards
 
 
 async def _match_and_broadcast_tappable_terms(
@@ -204,9 +212,14 @@ async def _match_and_broadcast_tappable_terms(
 
     payload = {"type": "tappable_terms", "terms": new_terms}
     subscribers = _get_subscribers(session_id)
-    logger.info(
-        "[tappable] broadcast session=%d subscribers=%d new_terms=%d",
+    # WARNING level so it actually shows up under uvicorn's default config —
+    # INFO gets dropped, and silence makes "are matchers firing?" impossible
+    # to answer from the log alone. The volume here is naturally bounded
+    # (each term broadcasts at most once per session).
+    logger.warning(
+        "[tappable] broadcast session=%d subscribers=%d new_terms=%d: %s",
         session_id, len(subscribers), len(new_terms),
+        [t["term"] for t in new_terms],
     )
     await _broadcast(subscribers, payload)
 
@@ -237,9 +250,10 @@ async def _match_and_broadcast_prompt_cards(
     _latest_prompt_cards[session_id] = cards
     payload = {"type": "prompt_cards", "cards": cards}
     subscribers = _get_subscribers(session_id)
-    logger.info(
-        "[prompt_cards] broadcast session=%d subscribers=%d cards=%d",
+    logger.warning(
+        "[prompt_cards] broadcast session=%d subscribers=%d cards=%d: %s",
         session_id, len(subscribers), len(cards),
+        [c["text"] for c in cards],
     )
     await _broadcast(subscribers, payload)
 

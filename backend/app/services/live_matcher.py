@@ -138,8 +138,10 @@ async def match_prompt_cards(
 
     Output shape matches the old generator so the broadcast payload is
     backwards-compatible with the existing pupil app:
-        [{"id": str, "question": str, "color": str}, ...]
+        [{"id": str, "text": str, "color": str}, ...]
     The "id" field is new but additive — older clients will ignore it.
+    The "text" key (not "question") is intentional: that's what the pupil
+    PromptCard.fromJson expects.
     """
     if not prompt_card_library or not transcript_text.strip():
         return []
@@ -168,7 +170,11 @@ async def match_prompt_cards(
     return [
         {
             "id": card["id"],
-            "question": card["question"],
+            # Wire-format key is "text" (not "question") — that's the field
+            # the Flutter app's PromptCard.fromJson reads. We keep "question"
+            # internally on the stored card library so the precompute prompts
+            # can ask Gemma in natural English, but rename here at broadcast.
+            "text": card["question"],
             "color": card.get("color", "blue"),
         }
         for _, card in scored[:_MAX_CARDS_PER_BROADCAST]
