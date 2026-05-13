@@ -189,6 +189,52 @@ function WaveformCard({ state, levels }: { state: WaveState; levels: number[] })
   );
 }
 
+// ── Word-by-word reveal ─────────────────────────────────────────────────────
+// Used on the most-recently-arrived transcript line so it streams in rather
+// than appearing as a block. Each word gets an animation-delay so they fade
+// in sequentially. Only animates on mount (stable key on the parent line
+// keeps the same spans from remounting), so once a line has settled it
+// stays still even when new lines arrive after it.
+function StreamingWords({ text }: { text: string }) {
+  // Split on whitespace but preserve the spacing in the output so we don't
+  // collapse multiple-space pauses or strip leading/trailing whitespace.
+  const tokens = text.split(/(\s+)/);
+
+  // Spread the reveal across roughly the chunk-collection window. Whisper
+  // returns whole chunks at intervals, so once one finishes animating there's
+  // dead time until the next arrives — animating *across* that window means
+  // words appear continuously instead of in bursts followed by silence.
+  // Clamped per-word so short chunks don't take forever and very long ones
+  // don't overflow into the next chunk's reveal.
+  const wordCount = tokens.filter((t) => !/^\s+$/.test(t)).length || 1;
+  const TARGET_TOTAL_MS = 2400;
+  const MIN_PER_WORD_MS = 90;
+  const MAX_PER_WORD_MS = 260;
+  const PER_WORD_MS = Math.max(
+    MIN_PER_WORD_MS,
+    Math.min(MAX_PER_WORD_MS, Math.round(TARGET_TOTAL_MS / wordCount)),
+  );
+  let wordIdx = 0;
+  return (
+    <>
+      {tokens.map((tok, i) => {
+        if (/^\s+$/.test(tok)) return <span key={i}>{tok}</span>;
+        const delay = wordIdx * PER_WORD_MS;
+        wordIdx += 1;
+        return (
+          <span
+            key={i}
+            className="ll-word"
+            style={{ animationDelay: `${delay}ms` }}
+          >
+            {tok}
+          </span>
+        );
+      })}
+    </>
+  );
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function formatDate(iso: string | null) {
   if (!iso) return "—";
@@ -872,7 +918,7 @@ function SessionsPanel({ teacherId }: { teacherId: number }) {
                       fontStyle: isRationalized ? "italic" : "normal",
                     }}
                   >
-                    {displayLine}
+                    {isLatest ? <StreamingWords text={displayLine} /> : displayLine}
                   </p>
                 </div>
                 );
