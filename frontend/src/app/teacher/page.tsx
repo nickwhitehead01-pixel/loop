@@ -7,6 +7,7 @@ import TeacherChat from "@/components/TeacherChat";
 import ConfirmDialog from "@/components/ConfirmDialog";
 import QuizPanel from "@/components/QuizPanel";
 import LessonProcessingStatus from "@/components/LessonProcessingStatus";
+import LiveFeaturesPanel from "@/components/LiveFeaturesPanel";
 
 const TEACHER_ID = 1;
 const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
@@ -46,12 +47,28 @@ type WaveState = "paused" | "waiting" | "listening" | "error";
 
 const WAVE_BAR_COUNT = 32;
 const IDLE_WAVE = Array.from({ length: WAVE_BAR_COUNT }, (_, idx) => 0.1 + ((idx % 5) * 0.025));
-const TRANSCRIBE_MIN_CHUNK_SECONDS = 0.6;
-const TRANSCRIBE_MAX_CHUNK_SECONDS = 6;
+// VAD timings tuned for "snappy" responsiveness over absolute accuracy.
+// A chunk flushes when EITHER (a) we've accumulated >= MIN seconds AND seen
+// >= SILENCE_HOLD seconds of silence, or (b) we've hit MAX seconds regardless.
+// So minimum end-to-end latency from sentence end → server ≈ SILENCE_HOLD.
+// Dropping MIN/SILENCE_HOLD from the old 0.6/0.35 to 0.4/0.2 trims ~0.35s
+// off perceived latency; the cost is slightly less context per Whisper call,
+// which is fine for a single clear teacher voice but would hurt in a noisy
+// room. Bump them back up if accuracy regresses.
+const TRANSCRIBE_MIN_CHUNK_SECONDS = 0.4;
+// Upper bound on a single audio chunk. There's a real trade-off here:
+//   - Higher values let Whisper land on natural silence boundaries → more
+//     accurate, but a teacher talking continuously sees a wall of text.
+//   - Lower values cap the worst-case latency, but a forced mid-utterance
+//     cut makes Whisper duplicate or drop the words straddling the boundary.
+// 4s is a middle ground: a teacher who pauses naturally will hit the
+// silence-based flush first (so accuracy is fine), and continuous speech
+// chunks at 4s — still snappy, fewer broken-word artifacts than at 2s.
+const TRANSCRIBE_MAX_CHUNK_SECONDS = 4;
 const TRANSCRIBE_MIN_RMS = 0.0015;
 const TRANSCRIBE_VOICE_ON_RMS = 0.003;
 const TRANSCRIBE_VOICE_OFF_RMS = 0.002;
-const TRANSCRIBE_SILENCE_HOLD_SECONDS = 0.35;
+const TRANSCRIBE_SILENCE_HOLD_SECONDS = 0.2;
 
 function writeWavHeader(view: DataView, sampleCount: number, sampleRate: number) {
   const writeString = (offset: number, value: string) => {
@@ -178,6 +195,52 @@ function WaveformCard({ state, levels }: { state: WaveState; levels: number[] })
         {stateLabel}
       </div>
     </div>
+  );
+}
+
+// ── Word-by-word reveal ─────────────────────────────────────────────────────
+// Used on the most-recently-arrived transcript line so it streams in rather
+// than appearing as a block. Each word gets an animation-delay so they fade
+// in sequentially. Only animates on mount (stable key on the parent line
+// keeps the same spans from remounting), so once a line has settled it
+// stays still even when new lines arrive after it.
+function StreamingWords({ text }: { text: string }) {
+  // Split on whitespace but preserve the spacing in the output so we don't
+  // collapse multiple-space pauses or strip leading/trailing whitespace.
+  const tokens = text.split(/(\s+)/);
+
+  // Spread the reveal across roughly the chunk-collection window. Whisper
+  // returns whole chunks at intervals, so once one finishes animating there's
+  // dead time until the next arrives — animating *across* that window means
+  // words appear continuously instead of in bursts followed by silence.
+  // Clamped per-word so short chunks don't take forever and very long ones
+  // don't overflow into the next chunk's reveal.
+  const wordCount = tokens.filter((t) => !/^\s+$/.test(t)).length || 1;
+  const TARGET_TOTAL_MS = 2400;
+  const MIN_PER_WORD_MS = 90;
+  const MAX_PER_WORD_MS = 260;
+  const PER_WORD_MS = Math.max(
+    MIN_PER_WORD_MS,
+    Math.min(MAX_PER_WORD_MS, Math.round(TARGET_TOTAL_MS / wordCount)),
+  );
+  let wordIdx = 0;
+  return (
+    <>
+      {tokens.map((tok, i) => {
+        if (/^\s+$/.test(tok)) return <span key={i}>{tok}</span>;
+        const delay = wordIdx * PER_WORD_MS;
+        wordIdx += 1;
+        return (
+          <span
+            key={i}
+            className="ll-word"
+            style={{ animationDelay: `${delay}ms` }}
+          >
+            {tok}
+          </span>
+        );
+      })}
+    </>
   );
 }
 
@@ -870,7 +933,7 @@ function SessionsPanel({ teacherId }: { teacherId: number }) {
                       fontStyle: isRationalized ? "italic" : "normal",
                     }}
                   >
-                    {displayLine}
+                    {isLatest ? <StreamingWords text={displayLine} /> : displayLine}
                   </p>
                 </div>
                 );
@@ -884,6 +947,11 @@ function SessionsPanel({ teacherId }: { teacherId: number }) {
           <p className="ll-body" style={{ color: "var(--error)" }}>{sessionError}</p>
         )}
       </div>
+
+      {/* Live-feature toggles — both Gemma-backed features default off on the
+          backend so transcription stays snappy. Shown above the quiz so the
+          teacher sees the perf escape hatch before they start asking questions. */}
+      {activeSession && <LiveFeaturesPanel sessionId={activeSession.id} />}
 
       {/* Quiz controls — only meaningful once the session is open and pupils
           are in the room. Mounting unconditionally on activeSession means the

@@ -218,6 +218,21 @@ html, body {
   from { opacity: 0; }
   to   { opacity: 1; }
 }
+
+/* Per-word reveal for the live transcript. Each word is a span with an
+   individual animation-delay applied inline, so they fade in one by one and
+   give the impression of streaming even though Whisper actually delivered
+   the whole chunk at once. The translateY(2px) → 0 is a tiny lift so the
+   eye catches new words landing rather than a pure fade. */
+.ll-word {
+  display: inline-block;
+  opacity: 0;
+  transform: translateY(2px);
+  animation: ll-word-in 0.18s cubic-bezier(0.2, 0.7, 0.2, 1) forwards;
+}
+@keyframes ll-word-in {
+  to { opacity: 1; transform: translateY(0); }
+}
 .ll-dialog {
   background: var(--paper);
   border: 1px solid var(--ink-soft);

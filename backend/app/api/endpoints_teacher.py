@@ -821,8 +821,28 @@ async def teacher_transcribe(
 
     # Prompt-card accumulator — fires _generate_and_broadcast_prompt_cards every
     # _TEACHER_CARD_INTERVAL utterances so pupils see context-aware suggestions.
-    _TEACHER_CARD_INTERVAL = 5
+    #
+    # Two competing pressures:
+    #   - Bigger window = each call has more context but more input tokens to
+    #     read, which on consumer hardware means a noticeable Gemma stall.
+    #   - Smaller window = each call is much quicker (Gemma latency is
+    #     dominated by input tokens) and the result reflects what was JUST
+    #     said, which is what pupils actually want for live prompt cards.
+    #
+    # 4 lands in the sweet spot: each batch covers ~12-16s of speech (with
+    # MAX_CHUNK=4s) — small enough that Gemma turns it round fast, large
+    # enough that the topic doesn't disappear between batches. The card
+    # utterance buffer is cleared after each fire so each call really does
+    # only see the new window, not a growing scrollback.
+    _TEACHER_CARD_INTERVAL = 3
     card_utterances: list[str] = []
+    # Counter used to alternate which of the two LLM-backed features runs on
+    # each tick. Firing both concurrently doubles up Gemma RAM/CPU pressure
+    # and the second call usually loses to the per-session "skip if busy"
+    # lock anyway, so it's invisible work. Alternating means each feature
+    # fires every other tick (≈ every 24s of speech with interval=3) and
+    # only one Gemma call is ever in flight at a time.
+    _llm_tick = 0
 
     async def maybe_rationalize() -> None:
         nonlocal raw_buffer, rationalize_in_flight
@@ -911,16 +931,33 @@ async def teacher_transcribe(
                             from app.api.endpoints_session import (  # noqa: PLC0415
                                 _generate_and_broadcast_prompt_cards,
                                 _generate_and_broadcast_tappable_terms,
+                                get_session_features,
                             )
-                            asyncio.create_task(
-                                _generate_and_broadcast_prompt_cards(session_id, card_text)
-                            )
-                            # Fire-and-forget tappable terms in parallel — one
-                            # extra Gemma call per batch, same skip-if-busy
-                            # lock prevents pile-ups during fast speech.
-                            asyncio.create_task(
-                                _generate_and_broadcast_tappable_terms(session_id, card_text)
-                            )
+                            features = get_session_features(session_id)
+                            # Alternate which feature runs on each tick so
+                            # only one Gemma call is ever in flight. Within
+                            # each branch we still respect the teacher's
+                            # feature flag — if the flag is off we just skip,
+                            # we don't fall through to the other feature.
+                            _llm_tick += 1
+                            if _llm_tick % 2 == 1:
+                                if features.get("prompt_cards"):
+                                    logger.info(
+                                        "[live-features] session=%d firing prompt_cards (tick=%d, words=%d)",
+                                        session_id, _llm_tick, len(card_text.split()),
+                                    )
+                                    asyncio.create_task(
+                                        _generate_and_broadcast_prompt_cards(session_id, card_text)
+                                    )
+                            else:
+                                if features.get("tappable_terms"):
+                                    logger.info(
+                                        "[live-features] session=%d firing tappable_terms (tick=%d, words=%d)",
+                                        session_id, _llm_tick, len(card_text.split()),
+                                    )
+                                    asyncio.create_task(
+                                        _generate_and_broadcast_tappable_terms(session_id, card_text)
+                                    )
 
                         # Buffer raw chunks and rationalize in small serialized batches.
                         raw_buffer.append(emit_text)
