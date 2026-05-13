@@ -61,7 +61,13 @@ class _TranscriptPageState extends State<TranscriptPage> {
   late final ChatSocketClient _chatClient = widget.chatClient ?? ChatSocketClient();
   final QuizRepository _quizRepository = QuizRepository();
 
+  // Two independent scroll positions: the left column tracks the teacher's
+  // live transcript (driven by the existing NotebookGutter), the right
+  // column tracks the chat with the Class Helper. Keeping them separate
+  // means a teacher chunk arriving mid-conversation doesn't kick the chat
+  // back to the bottom, and vice versa.
   final ScrollController _scroll = ScrollController();
+  final ScrollController _chatScroll = ScrollController();
   final List<_Entry> _entries = <_Entry>[];
 
   StreamSubscription<TranscriptChunk>? _transcriptSub;
@@ -240,7 +246,8 @@ class _TranscriptPageState extends State<TranscriptPage> {
             _replyTimeoutTimer?.cancel();
           }
         });
-        _scrollToBottomSoon();
+        // Helper tokens land in the right column, so scroll that one only.
+        _scrollToBottomSoon(_chatScroll);
       },
       onError: (Object error) {
         if (!mounted) return;
@@ -280,11 +287,12 @@ class _TranscriptPageState extends State<TranscriptPage> {
     }
   }
 
-  void _scrollToBottomSoon() {
+  void _scrollToBottomSoon([ScrollController? controller]) {
+    final ScrollController target = controller ?? _scroll;
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!_scroll.hasClients) return;
-      _scroll.animateTo(
-        _scroll.position.maxScrollExtent,
+      if (!target.hasClients) return;
+      target.animateTo(
+        target.position.maxScrollExtent,
         duration: const Duration(milliseconds: 220),
         curve: Curves.easeOut,
       );
@@ -312,7 +320,9 @@ class _TranscriptPageState extends State<TranscriptPage> {
       message: text,
       sessionId: widget.session.id,
     );
-    _scrollToBottomSoon();
+    // The pupil's question + the pending helper turn both land in the right
+    // column, so scroll that one.
+    _scrollToBottomSoon(_chatScroll);
 
     // Safety timeout: if no {done:true} arrives within 3 minutes, unlock the
     // Composer so the pupil isn't stuck waiting forever. The model is slow on
@@ -363,6 +373,7 @@ class _TranscriptPageState extends State<TranscriptPage> {
       _repo.dispose();
     }
     _scroll.dispose();
+    _chatScroll.dispose();
     super.dispose();
   }
 
@@ -392,25 +403,17 @@ class _TranscriptPageState extends State<TranscriptPage> {
         bottom: false,
         child: Stack(
           children: <Widget>[
+            // The top-level layout is now a row split: teacher transcript
+            // on the left, Class Helper conversation on the right. The
+            // waveform and any error banner span both columns at the top.
             Column(
               children: <Widget>[
                 Padding(
                   padding: const EdgeInsets.fromLTRB(36, 12, 36, 16),
                   child: Waveform(state: _waveState),
                 ),
-                PromptCardRow(
-                  cards: _promptCards,
-                  onCardTap: _onSend,
-                ),
                 if (_error != null) _ErrorBanner(message: _error!),
                 Expanded(child: _buildBody()),
-                Composer(
-                  enabled: !_awaitingChatReply,
-                  onSend: _onSend,
-                  placeholder: _awaitingChatReply
-                      ? 'Class Helper is answering…'
-                      : 'Ask the Class Helper…',
-                ),
               ],
             ),
             if (_activeQuizQuestion != null)
@@ -443,46 +446,109 @@ class _TranscriptPageState extends State<TranscriptPage> {
     if (widget.session.isLive && _entries.isEmpty && _error == null) {
       return const _WaitingRoom();
     }
+    // Two columns: teacher transcript on the left (with notebook gutter),
+    // Class Helper conversation on the right. The pupil's chat is now a
+    // permanent visual sidebar rather than a strip wedged underneath the
+    // transcript — easier to keep an eye on both streams at once.
     return Row(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: <Widget>[
-        Expanded(
-          child: ScrollConfiguration(
-            // Main column is tap-only — pupils scroll via the right gutter.
-            behavior: const _NoScrollBehaviour(),
-            child: ListView.builder(
-              controller: _scroll,
-              padding: const EdgeInsets.fromLTRB(36, 8, 12, 24),
-              itemCount: _entries.isEmpty ? 1 : _entries.length,
-              itemBuilder: (BuildContext context, int i) {
-                if (_entries.isEmpty) {
-                  return Padding(
-                    padding: const EdgeInsets.only(top: 24),
-                    child: Text(
-                      widget.session.isLive
-                          ? 'Listening for your teacher…'
-                          : 'No transcript was recorded for this lesson.',
-                      style: LoopType.ui.copyWith(color: LoopColors.inkMuted),
-                    ),
-                  );
-                }
-                final _Entry e = _entries[i];
-                // Only the TEACHER turns benefit from tappable underlines —
-                // pupil's own words and the Class Helper's streamed reply
-                // would just be visual noise.
-                return ui.Turn(
-                  speaker: _label(e.speaker),
-                  text: e.text,
-                  isStreaming: e.isStreaming,
-                  tappable: e.speaker == _Speaker.teacher,
-                  terms: _tappableTerms,
-                );
-              },
-            ),
-          ),
-        ),
+        Expanded(child: _buildTranscriptColumn()),
         NotebookGutter(controller: _scroll),
+        _buildChatColumn(context),
       ],
+    );
+  }
+
+  Widget _buildTranscriptColumn() {
+    final List<_Entry> teacherEntries = _entries
+        .where((_Entry e) => e.speaker == _Speaker.teacher)
+        .toList(growable: false);
+    return ScrollConfiguration(
+      // Main column is tap-only — pupils scroll via the right gutter.
+      behavior: const _NoScrollBehaviour(),
+      child: ListView.builder(
+        controller: _scroll,
+        padding: const EdgeInsets.fromLTRB(36, 8, 12, 24),
+        itemCount: teacherEntries.isEmpty ? 1 : teacherEntries.length,
+        itemBuilder: (BuildContext context, int i) {
+          if (teacherEntries.isEmpty) {
+            return Padding(
+              padding: const EdgeInsets.only(top: 24),
+              child: Text(
+                widget.session.isLive
+                    ? 'Listening for your teacher…'
+                    : 'No transcript was recorded for this lesson.',
+                style: LoopType.ui.copyWith(color: LoopColors.inkMuted),
+              ),
+            );
+          }
+          final _Entry e = teacherEntries[i];
+          return ui.Turn(
+            speaker: _label(e.speaker),
+            text: e.text,
+            isStreaming: e.isStreaming,
+            tappable: true, // teacher turns only — tappable underlines apply
+            terms: _tappableTerms,
+          );
+        },
+      ),
+    );
+  }
+
+  Widget _buildChatColumn(BuildContext context) {
+    // Width tuned for an iPad in landscape — narrow enough that the
+    // transcript still gets the lion's share, wide enough to read the
+    // helper's streaming reply comfortably.
+    const double chatColumnWidth = 360;
+    final List<_Entry> chatEntries = _entries
+        .where((_Entry e) => e.speaker != _Speaker.teacher)
+        .toList(growable: false);
+    return Container(
+      width: chatColumnWidth,
+      decoration: BoxDecoration(
+        color: LoopColors.paperShade,
+        border: Border(left: BorderSide(color: LoopColors.inkSoft)),
+      ),
+      child: Column(
+        children: <Widget>[
+          // Prompt cards float at the top of the chat column so they read
+          // as suggested starters for the conversation below.
+          PromptCardRow(
+            cards: _promptCards,
+            onCardTap: _onSend,
+          ),
+          Expanded(
+            child: chatEntries.isEmpty
+                ? _ChatEmptyState()
+                : ListView.builder(
+                    controller: _chatScroll,
+                    padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
+                    itemCount: chatEntries.length,
+                    itemBuilder: (BuildContext context, int i) {
+                      final _Entry e = chatEntries[i];
+                      return ui.Turn(
+                        speaker: _label(e.speaker),
+                        text: e.text,
+                        isStreaming: e.isStreaming,
+                        // Tappable underlines only make sense on teacher
+                        // turns; the pupil's own words and the helper's
+                        // streamed reply stay plain.
+                        tappable: false,
+                        terms: _tappableTerms,
+                      );
+                    },
+                  ),
+          ),
+          Composer(
+            enabled: !_awaitingChatReply,
+            onSend: _onSend,
+            placeholder: _awaitingChatReply
+                ? 'Class Helper is answering…'
+                : 'Ask the Class Helper…',
+          ),
+        ],
+      ),
     );
   }
 
@@ -523,6 +589,25 @@ class _ErrorBanner extends StatelessWidget {
     );
   }
 }
+
+/// Empty state for the chat column — visible until the pupil sends their
+/// first question (or taps a prompt card, which has the same effect).
+class _ChatEmptyState extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 16),
+        child: Text(
+          'Tap a prompt card above, or type a question to ask the Class Helper.',
+          textAlign: TextAlign.center,
+          style: LoopType.ui.copyWith(color: LoopColors.inkMuted),
+        ),
+      ),
+    );
+  }
+}
+
 
 /// Shown when the session is live but no speech has arrived yet.
 class _WaitingRoom extends StatelessWidget {
