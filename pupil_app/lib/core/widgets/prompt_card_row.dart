@@ -32,7 +32,7 @@ class PromptCardRow extends StatelessWidget {
                 scrollDirection: Axis.horizontal,
                 padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
                 itemCount: cards.length,
-                separatorBuilder: (_, __) => const SizedBox(width: 10),
+                separatorBuilder: (_, _) => const SizedBox(width: 10),
                 itemBuilder: (BuildContext context, int i) => PromptCardChip(
                   card: cards[i],
                   onTap: onCardTap,
