@@ -18,10 +18,9 @@ class Settings(BaseSettings):
     ollama_model_pupil: str = "gemma4:e2b"
     ollama_model_teacher: str = "gemma4:e2b"
     ollama_embed_model: str = "nomic-embed-text"
-    # Tappable-term flagging is a "classify-and-explain" task that doesn't
-    # need full pupil-agent reasoning. Using a smaller, faster model keeps
-    # the underline experience real-time even on a single-GPU classroom hub.
-    ollama_model_tappable: str = "gemma3:1b"
+    # (gemma3:1b was previously used for live tappable-term generation; that
+    # path is now pre-computed at lesson-upload time, so a second model on
+    # the live path is no longer needed.)
 
     # App
     debug: bool = False
