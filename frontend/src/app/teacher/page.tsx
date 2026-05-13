@@ -6,6 +6,7 @@ import StudentProgress from "@/components/StudentProgress";
 import TeacherChat from "@/components/TeacherChat";
 import ConfirmDialog from "@/components/ConfirmDialog";
 import QuizPanel from "@/components/QuizPanel";
+import LessonProcessingStatus from "@/components/LessonProcessingStatus";
 
 const TEACHER_ID = 1;
 const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
@@ -20,6 +21,13 @@ interface Lesson {
   created_at: string;
   summary: string | null;
   file_count: number;
+  // Pre-lesson processing fields used by LessonProcessingStatus to derive
+  // the current stage. Backend populates them in /teacher/lessons.
+  chunk_count: number;
+  glossary_count: number;
+  prompt_card_count: number;
+  precomputed_features_at: string | null;
+  precomputed_features_attempts: number;
 }
 
 interface SessionInfo {
@@ -200,9 +208,18 @@ function LessonsPanel({ teacherId }: { teacherId: number }) {
 
   useEffect(() => { load(); }, [load]);
 
-  // Poll every 8 s while any lesson is still pending background analysis
+  // Poll every 8 s while any lesson is still mid-pipeline. "Mid-pipeline"
+  // now means EITHER summary is null OR precompute hasn't finished and
+  // hasn't given up — so we keep refreshing through both worker stages,
+  // not just the summary step.
   useEffect(() => {
-    const hasPending = lessons.some((l) => l.summary === null);
+    const PRECOMPUTE_MAX_ATTEMPTS = 5;
+    const hasPending = lessons.some(
+      (l) =>
+        l.summary === null ||
+        (!l.precomputed_features_at &&
+          l.precomputed_features_attempts < PRECOMPUTE_MAX_ATTEMPTS),
+    );
     if (!hasPending) return;
     const id = setInterval(load, 8000);
     return () => clearInterval(id);
@@ -275,21 +292,18 @@ function LessonsPanel({ teacherId }: { teacherId: number }) {
                   </button>
                 </div>
               </div>
-              {l.summary ? (
+              {l.summary && (
                 <p className="ll-body" style={{ marginTop: 8, color: "var(--ink-muted)", fontSize: 14, overflow: "hidden", display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical" }}>
                   {l.summary}
                 </p>
-              ) : (
-                <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 10 }}>
-                  <svg width="13" height="13" viewBox="0 0 13 13" style={{ flexShrink: 0, animation: "ll-spin 1.1s linear infinite" }} aria-hidden="true">
-                    <circle cx="6.5" cy="6.5" r="5" fill="none" stroke="var(--ink-soft)" strokeWidth="2" />
-                    <path d="M6.5 1.5 A5 5 0 0 1 11.5 6.5" fill="none" stroke="var(--action)" strokeWidth="2" strokeLinecap="round" />
-                  </svg>
-                  <p style={{ fontSize: 13, color: "var(--ink-muted)", fontFamily: "var(--font-sans)" }}>
-                    AI analysis in progress — check back in a few minutes
-                  </p>
-                </div>
               )}
+              {/* Step indicator. Once the summary is showing, the indicator
+                  drops below it and continues to track precompute progress;
+                  before the summary it stands alone in place of the body
+                  text. Hidden when everything's done so the row goes quiet. */}
+              <div style={{ marginTop: l.summary ? 8 : 10 }}>
+                <LessonProcessingStatus lesson={l} hideWhenReady />
+              </div>
             </div>
           ))}
         </div>
