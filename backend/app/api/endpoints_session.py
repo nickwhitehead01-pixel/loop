@@ -31,7 +31,7 @@ from app.models.schemas import (
 )
 from app.services import ollama_client
 from app.services.chroma_client import transcript_chunks_col
-from app.services.transcription import transcribe_chunk
+from app.services.transcription import transcribe_chunk, is_valid_transcript
 from app.services import slide_sync
 from app.services.live_matcher import match_prompt_cards, match_tappable_terms
 
@@ -447,6 +447,13 @@ async def audio_stream(
             if not result.text:
                 continue
 
+            # ── Junk-bucket filter ─────────────────────────────────────
+            # Drop noise bursts, Whisper hallucinations, and repetition
+            # loops before any DB writes or downstream work. Especially
+            # important without a wearable mic.
+            if not is_valid_transcript(result.text):
+                continue
+
             timestamp_ms = int((time.time() - session_start) * 1000)
 
             # ── Immediate SQLite write — no embedding, no bucket wait ───
@@ -512,6 +519,10 @@ async def audio_stream(
                         asyncio.create_task(
                             _generate_and_broadcast_prompt_cards(session_id, flushed_text)
                         )
+                    if get_session_features(session_id).get("tappable_terms"):
+                        asyncio.create_task(
+                            _generate_and_broadcast_tappable_terms(session_id, flushed_text)
+                        )
                     # Bucket flush already covers the recent speech; reset
                     # the card-utterance accumulator to avoid double-firing.
                     card_utterances.clear()
@@ -535,17 +546,27 @@ async def audio_stream(
         try:
             flushed_text = await flush_bucket()
             if flushed_text:
-                asyncio.create_task(
-                    _generate_and_broadcast_prompt_cards(session_id, flushed_text)
-                )
+                if get_session_features(session_id).get("prompt_cards"):
+                    asyncio.create_task(
+                        _generate_and_broadcast_prompt_cards(session_id, flushed_text)
+                    )
+                if get_session_features(session_id).get("tappable_terms"):
+                    asyncio.create_task(
+                        _generate_and_broadcast_tappable_terms(session_id, flushed_text)
+                    )
             elif card_utterances:
                 # Bucket was empty (already flushed) but there are card utterances
                 # that haven't fired yet — generate cards from those.
                 card_text = " ".join(card_utterances)
                 card_utterances.clear()
-                asyncio.create_task(
-                    _generate_and_broadcast_prompt_cards(session_id, card_text)
-                )
+                if get_session_features(session_id).get("prompt_cards"):
+                    asyncio.create_task(
+                        _generate_and_broadcast_prompt_cards(session_id, card_text)
+                    )
+                if get_session_features(session_id).get("tappable_terms"):
+                    asyncio.create_task(
+                        _generate_and_broadcast_tappable_terms(session_id, card_text)
+                    )
         except Exception as flush_err:
             logger.warning("Could not flush bucket on disconnect for session %d: %s", session_id, flush_err)
     except Exception as e:
