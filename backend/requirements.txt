@@ -20,6 +20,7 @@ langchain-core==0.3.52
 langchain-ollama==0.3.2
 langchain-community==0.3.21
 httpx==0.28.1
+json-repair>=0.30.0
 
 # Document processing
 pypdf==5.4.0

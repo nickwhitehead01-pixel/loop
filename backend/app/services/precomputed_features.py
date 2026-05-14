@@ -40,35 +40,52 @@ _TARGET_PROMPT_CARD_COUNT = (8, 12)
 
 
 # ---------------------------------------------------------------------------
+# Shared system prompt — locks the model into JSON-only mode
+# ---------------------------------------------------------------------------
+
+_JSON_SYSTEM_PROMPT = (
+    "You are a JSON API endpoint. "
+    "Respond ONLY with valid JSON matching the exact schema shown in the user message. "
+    "Do not write any text before or after the JSON. "
+    "No explanations, no markdown, no code fences, no commentary."
+)
+
+
+# ---------------------------------------------------------------------------
 # Glossary generation
 # ---------------------------------------------------------------------------
 
 _GLOSSARY_PROMPT = (
-    "You are preparing pupil-facing study aids from a lesson document. "
-    "Your readers are 11-15 year olds, some with special educational needs. "
-    "Their vocabulary is narrower than an adult's — words you might call "
-    "'everyday' can still trip them up.\n\n"
-    "Pick {min}-{max} words and short phrases from the lesson content that "
-    "any pupil in this age group MIGHT need explained. When in doubt, "
-    "INCLUDE the term — pupils can ignore an underline they don't need, "
-    "but they can't ask about an explanation that isn't there. Cast a wide "
-    "net:\n"
-    "- domain-specific or technical terms (the obvious ones)\n"
-    "- unusual verbs and adjectives ('absorb', 'combine', 'release')\n"
-    "- abstract nouns ('source', 'process', 'equation', 'energy')\n"
-    "- proper nouns of historical/cultural significance\n"
-    "- compound words or short phrases that act like single concepts\n"
-    "- words a teacher would casually use but a pupil might not have met\n\n"
-    "Only skip words that a 6-year-old would already know cold.\n\n"
-    "For each term, write a one- or two-sentence plain-language explanation. "
-    "Friendly tone, no jargon, no condescension, no \"this means\" filler. "
-    "Imagine you're explaining to a curious 10-year-old sitting next to you.\n\n"
-    "Lesson content:\n"
+    "REQUIRED OUTPUT FORMAT:\n"
+    '{{"terms": [{{"term": "word or phrase", "explanation": "one or two plain sentences"}}, ...]}}\n\n'
+    "TASK: Extract {min}-{max} vocabulary terms from the lesson below for pupils aged 11-15. "
+    "Include any word a pupil might not know: technical terms, abstract nouns, "
+    "unusual verbs, proper nouns of significance, and subject-specific phrases. "
+    "When in doubt, include the term. "
+    "For each term write a friendly one- or two-sentence explanation a curious 10-year-old would understand.\n\n"
+    "LESSON CONTENT:\n"
     "---\n{content}\n---\n\n"
-    "Reply with ONLY a JSON object of the form "
-    '{{"terms": [{{"term": "...", "explanation": "..."}}, ...]}}. '
-    "No commentary, no markdown."
+    "Respond with ONLY this JSON (no other text):\n"
+    '{{"terms": [{{"term": "...", "explanation": "..."}}, ...]}}'
 )
+
+
+def _repair_and_parse(text: str) -> object:
+    """Parse JSON with json_repair as fallback for malformed LLM output.
+
+    Gemma sometimes emits unescaped inner quotes or apostrophes inside
+    explanation strings, producing a JSONDecodeError. json_repair handles
+    the most common LLM JSON quirks (unescaped quotes, truncated arrays, etc).
+    """
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        try:
+            from json_repair import repair_json
+            repaired = repair_json(text, return_objects=True)
+            return repaired
+        except Exception:
+            raise ValueError(f"JSON parse failed and json_repair could not fix it")
 
 
 def _parse_list(raw: str, *, primary_key: str | None = None) -> list:
@@ -78,6 +95,7 @@ def _parse_list(raw: str, *, primary_key: str | None = None) -> list:
     JSON object, so we usually get ``{"terms": [...]}`` or similar — but
     we also tolerate a bare array (in case format mode is dropped), and a
     dict with the array under any key (in case Gemma renames it).
+    Uses json_repair as a fallback when Gemma emits unescaped characters.
     """
     # Strip stray prose around the JSON if the model decided to be chatty.
     obj_start = raw.find("{")
@@ -87,17 +105,27 @@ def _parse_list(raw: str, *, primary_key: str | None = None) -> list:
     # Whichever opens first is the top-level shape.
     if arr_start != -1 and (obj_start == -1 or arr_start < obj_start):
         end = raw.rfind("]") + 1
-        return json.loads(raw[arr_start:end])
+        return _repair_and_parse(raw[arr_start:end])
     end = raw.rfind("}") + 1
-    parsed = json.loads(raw[obj_start:end])
+    parsed = _repair_and_parse(raw[obj_start:end])
     if not isinstance(parsed, dict):
         raise ValueError("Expected dict at top level, got %r" % type(parsed).__name__)
     if primary_key and isinstance(parsed.get(primary_key), list):
         return parsed[primary_key]
-    # Last-resort: take the first list-valued field.
+    # Last-resort 1: take the first list-valued field.
     for value in parsed.values():
         if isinstance(value, list):
             return value
+    # Last-resort 2: the model returned the wrong outer object entirely
+    # (e.g. a QA-style {"selected_answer": ..., "reason": ...}). If the raw
+    # string still contains an embedded array, extract it directly.
+    if arr_start != -1:
+        end2 = raw.rfind("]") + 1
+        if end2 > arr_start:
+            try:
+                return _repair_and_parse(raw[arr_start:end2])
+            except (json.JSONDecodeError, ValueError):
+                pass
     raise ValueError(f"No list found in object (keys: {list(parsed.keys())})")
 
 
@@ -115,6 +143,7 @@ async def generate_glossary(lesson_content: str) -> list[dict]:
     raw = await ollama_client.generate_full(
         messages=[{"role": "user", "content": prompt}],
         model=settings.ollama_model_teacher,
+        system=_JSON_SYSTEM_PROMPT,
         format="json",
     )
     parsed = _parse_list(raw, primary_key="terms")
@@ -144,24 +173,19 @@ async def generate_glossary(lesson_content: str) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 _PROMPT_CARDS_PROMPT = (
-    "You are preparing pupil-facing prompt cards for a lesson. Each card "
-    "is a question a pupil might naturally want to ask while listening to "
-    "this material, with a list of trigger phrases that should make the "
-    "card surface (when the teacher's speech contains any of them).\n\n"
-    "Produce {min}-{max} cards. Each card has:\n"
-    "  - question: under 12 words, written as a pupil would ask it.\n"
-    "  - triggers: 2-4 short phrases (1-4 words each) from the lesson "
-    "content that should trigger this card. Use the lesson's actual "
-    "vocabulary, not paraphrases.\n\n"
-    "Pick cards that cover DIFFERENT parts of the lesson, not five "
-    "variants of the same question. Skip ideas the pupil could answer "
-    "themselves from the teacher's words alone — focus on the curious "
-    "\"why\" and \"how\" questions.\n\n"
-    "Lesson content:\n"
+    # Schema FIRST — repeated at the end after the content.
+    "REQUIRED OUTPUT FORMAT:\n"
+    '{{"cards": [{{"question": "short pupil question", "triggers": ["phrase1", "phrase2"]}}, ...]}}\n\n'
+    "TASK: Create {min}-{max} prompt cards from the lesson below. "
+    "Each card is a question a pupil might ask while listening. "
+    "Each card has a question (under 12 words, written as a pupil would ask it) "
+    "and 2-4 trigger phrases (1-4 words each, taken directly from the lesson text) "
+    "that should make the card appear. "
+    "Cover DIFFERENT parts of the lesson. Focus on curious 'why' and 'how' questions.\n\n"
+    "LESSON CONTENT:\n"
     "---\n{content}\n---\n\n"
-    "Reply with ONLY a JSON object of the form "
-    '{{"cards": [{{"question": "...", "triggers": ["...", "..."]}}, ...]}}. '
-    "No commentary, no markdown."
+    "Respond with ONLY this JSON (no other text):\n"
+    '{{"cards": [{{"question": "...", "triggers": ["...", "..."]}}, ...]}}'
 )
 
 
@@ -181,6 +205,7 @@ async def generate_prompt_card_library(lesson_content: str) -> list[dict]:
     raw = await ollama_client.generate_full(
         messages=[{"role": "user", "content": prompt}],
         model=settings.ollama_model_teacher,
+        system=_JSON_SYSTEM_PROMPT,
         format="json",
     )
     parsed = _parse_list(raw, primary_key="cards")
