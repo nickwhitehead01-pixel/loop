@@ -111,6 +111,6 @@ async def summarise_lesson(
         )
         return summary.strip() if summary and summary.strip() else "Summary generation failed."
     except Exception:
-        logger.warning("summarise_lesson failed for lesson %d", lesson_id)
+        logger.exception("summarise_lesson failed for lesson %d", lesson_id)
         return "Summary generation failed."
 

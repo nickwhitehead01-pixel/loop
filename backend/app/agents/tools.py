@@ -1,26 +1,24 @@
 """
-LangChain tools available to the pupil agent.
+Retrieval functions called directly by the pupil and teacher agents.
 
-Six tools expose distinct capabilities so the LangGraph ReAct loop
-can decide *which* to invoke based on the pupil's message:
+Replaced the old LangGraph @tool pattern — functions are invoked inline
+via keyword dispatch rather than being registered in a ReAct loop. No tool
+schemas, no intermediate LLM "which tool?" step.
 
-  retrieve_context        — semantic search over teacher-uploaded lesson chunks
-  get_pupil_memories      — similarity search over this pupil's long-term memories
-  get_conversation_history — load the last N messages for a given conversation
-  list_lessons            — list lesson titles available to the pupil
-  search_live_transcript  — semantic search over live/recent transcript chunks
-  get_full_transcript     — get the full ordered transcript for a session
+  retrieve_context         — vector search over teacher-uploaded lesson chunks (ChromaDB)
+  get_conversation_history — last N messages for the context window
+  list_lessons             — lesson titles for "what topics exist?" queries
+  get_pupil_memories       — similarity search over this pupil's long-term fact store
+  search_live_transcript   — vector search over live transcript (session-scoped)
+  get_full_transcript      — ordered transcript text capped by word budget
 """
 from __future__ import annotations
 
-from typing import Annotated
-
-from langchain_core.tools import tool
-from sqlalchemy import select, func
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.models.domain import Conversation, Lesson, LessonChunk, Message, PupilMemory, TranscriptChunk
+from app.models.domain import Lesson, Message, PupilMemory, TranscriptChunk
 from app.services.chroma_client import lesson_chunks_col, pupil_memories_col, transcript_chunks_col
 
 
@@ -29,7 +27,8 @@ from app.services.chroma_client import lesson_chunks_col, pupil_memories_col, tr
 # ---------------------------------------------------------------------------
 
 async def _embed(text: str, http_client) -> list[float]:
-    """Call Ollama embed endpoint and return a float vector."""
+    """Accepts an injected http_client so callers can share one client
+    across an entire request rather than opening a new connection per embed call."""
     response = await http_client.post(
         f"{settings.ollama_base_url}/api/embed",
         json={"model": settings.ollama_embed_model, "input": text},

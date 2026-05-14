@@ -143,7 +143,7 @@ async def sync_slide_from_transcript(
             )
 
     except Exception as exc:
-        logger.warning("[slide_sync] session=%d failed (skipping): %s", session_id, exc)
+        logger.warning("[slide_sync] session=%d failed (skipping)", session_id, exc_info=True)
 
 
 def get_current_slide(session_id: int) -> SlidePosition | None:

@@ -240,11 +240,11 @@ async def suggest_question(
             format="json",
         )
         return _parse_suggestion(raw)
-    except Exception as e:
+    except Exception:
         logger.exception("Quiz suggestion failed for session %d", session_id)
         raise HTTPException(
             status_code=502,
-            detail=f"LLM suggestion failed: {e}",
+            detail="LLM suggestion failed — please try again",
         )
 
 

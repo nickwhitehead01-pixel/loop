@@ -3,9 +3,9 @@
 LoopLens Hub — setup and launcher script.
 
 Usage:
-    python setup.py install   — install all dependencies, create data dirs, write .env
-    python setup.py start     — launch backend (uvicorn) + frontend (npm run dev)
-    python setup.py start --prod  — launch backend + frontend (npm start) in production mode
+    python run.py install   — install all dependencies, create data dirs, write .env
+    python run.py start     — launch backend (uvicorn) + frontend (npm run dev)
+    python run.py start --prod  — launch backend + frontend (npm start) in production mode
 """
 from __future__ import annotations
 

@@ -38,9 +38,8 @@ class ChatSocketClient {
 }
 
 class ChatStreamFrame {
-  const ChatStreamFrame({required this.token, required this.done, this.error});
+  const ChatStreamFrame({required this.token, required this.done});
 
   final String token;
   final bool done;
-  final String? error;
 }

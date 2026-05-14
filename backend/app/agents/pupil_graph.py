@@ -161,7 +161,7 @@ async def _extract_and_store_memories(
             await save_pupil_memories_func(pupil_id, new_memories, mem_db, http_client)
             await mem_db.commit()
     except Exception:
-        pass  # must never surface errors
+        logger.debug("Memory extraction failed for pupil %d — continuing", pupil_id, exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -180,7 +180,6 @@ async def run_pupil_agent(
     Run the pupil agent and yield response tokens one at a time.
     Uses direct-invoke: one retrieval, one LLM call, no ReAct loop.
     """
-    # Persist the incoming user message
     db.add(Message(
         conversation_id=conversation_id,
         role=MessageRole.user,
@@ -203,7 +202,6 @@ async def run_pupil_agent(
     # --- Embed once, share vector across memory + context retrieval ---
     tool_name = _dispatch_tool(user_message, session_id)
 
-    # Embed once — shared across memory similarity search and context retrieval
     shared_vector: list[float] = await _embed_fn(user_message, http_client)
 
     # Fetch memories (using shared vector) + history in parallel
@@ -291,7 +289,9 @@ async def run_pupil_agent(
         lc_messages.append(cls(content=m["content"]))
     lc_messages.append(HumanMessage(content=user_message))
 
-    # --- Single LLM call — no ReAct loop, no tool schemas ---
+    # Single LLM call — no ReAct loop, no tool schemas.
+    # temperature=0.7: higher than the teacher agent (0.4) so tutoring responses
+    # feel warm and naturally varied rather than robotically consistent.
     llm = ChatOllama(
         model=settings.ollama_model_pupil,
         base_url=settings.ollama_base_url,
@@ -317,11 +317,10 @@ async def run_pupil_agent(
             ))
             await db.flush()
 
-        # --- Store in semantic cache ---
         try:
             await _sem_cache.store(user_message, assistant_content, db, session_id=session_id)
         except Exception:
-            pass
+            logger.debug("Semantic cache store failed", exc_info=True)
 
         await db.commit()
 

@@ -53,9 +53,9 @@ from app.models.domain import (
 )
 from app.models.schemas import (
     LessonResponse,
+    PupilProgress,
     SessionAnalytics,
     SessionResponse,
-    StudentProgress,
 )
 
 logger = logging.getLogger(__name__)
@@ -127,7 +127,6 @@ def _fast_rationalize(text: str, glossary: dict[str, str]) -> str:
 async def _rationalize_and_send(
     websocket: WebSocket,
     chunks: list[str],
-    session_title: str,
     lesson_glossary: dict[str, str],
 ) -> None:
     """Clean up a batch of raw STT chunks quickly and send a rationalized frame."""
@@ -197,11 +196,10 @@ async def _persist_transcript_chunk(session_id: int, content: str, timestamp_ms:
                 "sqlite_id": str(chunk_id),
             }],
         )
-    except Exception as exc:
-        logger.warning(
-            "Transcript persistence failed for session %d: %s",
+    except Exception:
+        logger.exception(
+            "Transcript persistence failed for session %d",
             session_id,
-            exc,
         )
 
 
@@ -262,7 +260,6 @@ async def upload_lesson(
     await db.flush()
     await db.refresh(lesson)
 
-    # Persist each file and ingest its chunks
     for filename, content in file_entries:
         dest = upload_dir / filename
         if not dest.exists():
@@ -274,18 +271,19 @@ async def upload_lesson(
         ))
         try:
             await process_lesson(lesson.id, content, db, filename=filename)
-        except Exception as e:
-            logger.error(f"Failed to process lesson file {filename}: {e}", exc_info=True)
+        except Exception:
+            logger.exception("Failed to process lesson file %s", filename)
             raise HTTPException(
                 status_code=500,
-                detail=f"Failed to process {filename}: {str(e)}"
+                detail=f"Failed to process {filename}",
             )
 
     await db.commit()
 
     await db.refresh(lesson)
 
-    # Attach computed file_count for the response
+    # file_count is not a DB column — set dynamically so the Pydantic
+    # response model can include it without a second query.
     lesson.file_count = len(file_entries)  # type: ignore[attr-defined]
     return lesson
 
@@ -295,7 +293,6 @@ async def list_lessons(
     teacher_id: int | None = None,
     db: AsyncSession = Depends(get_db),
 ):
-    from app.models.domain import LessonFile as LF
     query = select(Lesson).order_by(Lesson.created_at.desc())
     if teacher_id is not None:
         query = query.where(Lesson.teacher_id == teacher_id)
@@ -305,11 +302,10 @@ async def list_lessons(
     if lessons:
         ids = [l.id for l in lessons]
 
-        # File counts
         file_counts_result = await db.execute(
-            select(LF.lesson_id, sa_func.count(LF.id).label("cnt"))
-            .where(LF.lesson_id.in_(ids))
-            .group_by(LF.lesson_id)
+            select(LessonFile.lesson_id, sa_func.count(LessonFile.id).label("cnt"))
+            .where(LessonFile.lesson_id.in_(ids))
+            .group_by(LessonFile.lesson_id)
         )
         file_counts = {row.lesson_id: row.cnt for row in file_counts_result}
 
@@ -358,13 +354,13 @@ async def get_lesson_detail(
             logger.exception("summarise_lesson failed for lesson %d", lesson_id)
             summary = None
 
-    # Load associated files
     files_result = await db.execute(
         select(LessonFile).where(LessonFile.lesson_id == lesson_id).order_by(LessonFile.id)
     )
     files = files_result.scalars().all()
 
-    # Load indexed chunks (content only — skip the embedding vector)
+    # Select content only — the embedding column is ~3KB per row (768 floats)
+    # and irrelevant to the detail view.
     chunks_result = await db.execute(
         select(LessonChunk.id, LessonChunk.content)
         .where(LessonChunk.lesson_id == lesson_id)
@@ -611,7 +607,7 @@ async def session_analytics(
 # Students
 # ---------------------------------------------------------------------------
 
-@router.get("/students", response_model=list[StudentProgress])
+@router.get("/students", response_model=list[PupilProgress])
 async def list_students(db: AsyncSession = Depends(get_db)):
     result = await db.execute(
         select(
@@ -628,7 +624,7 @@ async def list_students(db: AsyncSession = Depends(get_db)):
     )
     rows = result.all()
     return [
-        StudentProgress(
+        PupilProgress(
             pupil_id=r.pupil_id,
             pupil_name=r.pupil_name,
             message_count=r.message_count or 0,
@@ -762,6 +758,12 @@ async def teacher_chat(
 
     except WebSocketDisconnect:
         logger.info("Teacher %d disconnected", teacher_id)
+    except Exception:
+        logger.exception("Unhandled error in teacher_chat for teacher %d", teacher_id)
+        try:
+            await websocket.close(code=1011)
+        except Exception:
+            pass  # client already disconnected
 
 
 # ---------------------------------------------------------------------------
@@ -790,10 +792,9 @@ async def teacher_transcribe(
     last_emitted_text = ""
     session_started_monotonic = time.monotonic()
 
-    # Fetch session title and lesson material for rationalization context
+    # Fetch session lesson material for rationalization context
     sess_result = await db.execute(select(LessonSession).where(LessonSession.id == session_id))
     _sess = sess_result.scalar_one_or_none()
-    session_title = _sess.title if _sess else "Classroom lesson"
 
     # Promote session from 'open' → 'live' now that transcription is starting.
     if _sess and _sess.status == SessionStatus.open:
@@ -814,7 +815,7 @@ async def teacher_transcribe(
         chunk_texts = [row[0] for row in chunks_result.all()]
         lesson_glossary = _build_lesson_glossary(chunk_texts)
     except Exception:
-        pass  # Context is optional — never block transcription
+        logger.debug("Glossary build failed for session %d — skipping", session_id, exc_info=True)
 
     raw_buffer: list[str] = []
     rationalize_in_flight = False
@@ -852,7 +853,7 @@ async def teacher_transcribe(
         batch = raw_buffer[:2]
         rationalize_in_flight = True
         try:
-            await _rationalize_and_send(websocket, batch, session_title, lesson_glossary)
+            await _rationalize_and_send(websocket, batch, lesson_glossary)
             raw_buffer = raw_buffer[len(batch):]
         finally:
             rationalize_in_flight = False
@@ -974,14 +975,15 @@ async def teacher_transcribe(
                     await db.commit()
                     logger.info("Teacher %d disconnected during transcription for session %d", teacher_id, session_id)
                     break
-                except Exception as exc:
-                    logger.error("Transcription error: %s", exc)
+                except Exception:
+                    logger.exception("Transcription error for teacher %d session %d", teacher_id, session_id)
                     await db.rollback()
                     try:
-                        await websocket.send_json({"type": "error", "detail": str(exc)})
+                        await websocket.send_json({"type": "error", "detail": "Transcription error"})
                     except RuntimeError:
                         logger.info("Teacher %d socket already closed for session %d", teacher_id, session_id)
                         break
+                    break  # stop looping — if transcription is broken, don't infinite-loop
 
             # Text message: control command (optional)
             elif "text" in message:
@@ -997,4 +999,10 @@ async def teacher_transcribe(
     except WebSocketDisconnect:
         await db.commit()
         logger.info("Teacher %d stopped transcribing session %d", teacher_id, session_id)
+    except Exception:
+        logger.exception("Unhandled error in teacher_transcribe for teacher %d session %d", teacher_id, session_id)
+        try:
+            await websocket.close(code=1011)
+        except Exception:
+            pass  # client already disconnected
 

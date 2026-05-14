@@ -121,6 +121,7 @@ def _extract_images_pdf(data: bytes) -> list[tuple[int, bytes]]:
                     if len(img_bytes) >= _MIN_IMAGE_BYTES:
                         images.append((page_idx + 1, img_bytes))
                 except Exception:
+                    logger.debug("PDF image extraction failed for page %d xref %d — skipping", page_idx + 1, xref, exc_info=True)
                     continue
     finally:
         pdf.close()
@@ -142,6 +143,7 @@ def _extract_images_pptx(data: bytes) -> list[tuple[int, bytes]]:
                     if len(img_bytes) >= _MIN_IMAGE_BYTES:
                         images.append((slide_idx + 1, img_bytes))
                 except Exception:
+                    logger.debug("PPTX image extraction failed for slide %d — skipping", slide_idx + 1, exc_info=True)
                     continue
     return images
 
@@ -159,6 +161,7 @@ def _extract_images_docx(data: bytes) -> list[tuple[int, bytes]]:
                 if len(img_bytes) >= _MIN_IMAGE_BYTES:
                     images.append((0, img_bytes))
             except Exception:
+                logger.debug("DOCX image extraction failed — skipping", exc_info=True)
                 continue
     return images
 
@@ -370,9 +373,9 @@ async def ingest_lesson_images(
             if description:
                 image_chunks.append(description)
                 image_slide_numbers.append(location)
-        except Exception as exc:
+        except Exception:
             logger.warning(
-                "lesson_id=%s — image description failed (skipping): %s", lesson_id, exc
+                "lesson_id=%s — image description failed (skipping)", lesson_id, exc_info=True
             )
 
     if not image_chunks:

@@ -168,7 +168,7 @@ async def _extract_and_store_memories(teacher_id: int, user_message: str, assist
                 )
             await mem_db.commit()
     except Exception:
-        pass  # memory extraction must never surface errors
+        logger.debug("Memory extraction failed for teacher %d — continuing", teacher_id, exc_info=True)
 
 
 async def _detect_and_invoke_tool(user_message: str, db: AsyncSession, teacher_id: int) -> str | None:
@@ -178,7 +178,6 @@ async def _detect_and_invoke_tool(user_message: str, db: AsyncSession, teacher_i
     """
     msg_lower = user_message.lower()
 
-    # Check each tool's keywords
     for tool_name, keywords in TOOL_KEYWORDS.items():
         if any(kw in msg_lower for kw in keywords):
             logger.info(f"Detected tool: {tool_name}")
@@ -267,9 +266,12 @@ async def _detect_and_invoke_tool(user_message: str, db: AsyncSession, teacher_i
                         parts.append(f"[Session {sid} — {mins:02d}:{secs:02d}] {doc}")
                     return "\n\n".join(parts)
 
-            except Exception as e:
-                logger.error(f"Error invoking tool {tool_name}: {e}", exc_info=True)
-                return f"Error retrieving {tool_name}: {str(e)}"
+            except (ValueError, TypeError) as e:
+                logger.warning("Tool %s rejected input: %s", tool_name, e, exc_info=True)
+                return f"[Tool error: invalid input for '{tool_name}']"
+            except Exception:
+                logger.exception("Tool %s invocation failed", tool_name)
+                return f"[Tool '{tool_name}' temporarily unavailable]"
 
     return None
 
@@ -306,10 +308,8 @@ async def run_teacher_agent(
     prior_memories = list(mem_result.scalars().all())
     history = list(reversed(hist_result.scalars().all()))
 
-    # Try to detect and invoke appropriate tool
     tool_result = await _detect_and_invoke_tool(user_message, db, teacher_id)
 
-    # Build system prompt
     system_lines = [_BASE_SYSTEM]
     if prior_memories:
         block = "\n".join(f"- {m}" for m in prior_memories)
@@ -326,7 +326,9 @@ async def run_teacher_agent(
         lc_messages.append(cls(content=m.content))
     lc_messages.append(HumanMessage(content=user_message))
 
-    # Invoke LLM directly (no ReAct loop)
+    # Single LLM call — no ReAct loop or tool-schema overhead.
+    # temperature=0.4: lower than the pupil agent (0.7) so analytical answers
+    # stay factually grounded rather than creatively rephrased.
     llm = ChatOllama(
         model=settings.ollama_model_teacher,
         base_url=settings.ollama_base_url,

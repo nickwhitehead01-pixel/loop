@@ -25,7 +25,6 @@ from app.models.domain import (
     LessonSession,
     PupilSessionSummary,
     QuizAttempt,
-    QuizGrade,
     QuizQuestion,
     QuizQuestionStatus,
     SessionStatus,
@@ -123,7 +122,6 @@ async def pupil_chat(
                     "conversation_id": conversation_id,
                 })
 
-            # Stream response tokens
             async for token in run_pupil_agent(
                 user_message=user_message,
                 conversation_id=conversation_id,
@@ -138,8 +136,12 @@ async def pupil_chat(
 
     except WebSocketDisconnect:
         logger.info("Pupil %d disconnected from chat", pupil_id)
-    except Exception as e:
-        logger.error("Chat error for pupil %d: %s", pupil_id, e)
+    except Exception:
+        logger.exception("Chat error for pupil %d", pupil_id)
+        try:
+            await websocket.close(code=1011)
+        except Exception:
+            pass  # client already disconnected
 
 
 # ---------------------------------------------------------------------------

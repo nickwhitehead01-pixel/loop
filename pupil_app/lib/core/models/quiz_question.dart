@@ -9,7 +9,7 @@ class QuizQuestion {
     required this.sessionId,
     required this.questionText,
     required this.timeLimitSeconds,
-    required this.deadlineMs,
+    this.deadlineMs,
     this.topicTag,
   });
 
@@ -21,7 +21,7 @@ class QuizQuestion {
   /// Server-clock unix-millis after which the client should refuse input.
   /// Drives the countdown directly so all pupils agree on the deadline even
   /// if their device clocks drift.
-  final int deadlineMs;
+  final int? deadlineMs;
   final String? topicTag;
 
   factory QuizQuestion.fromBroadcastJson(Map<String, dynamic> payload) {

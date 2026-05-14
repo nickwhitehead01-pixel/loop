@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 import uuid
 
-from sqlalchemy import select, update
+from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
@@ -55,6 +55,7 @@ async def lookup(
         results = col.query(**kwargs)
     except Exception:
         # Collection empty or query error — treat as miss
+        logger.debug("SemanticCache lookup error — treating as miss", exc_info=True)
         return None
 
     distances = (results.get("distances") or [[]])[0]

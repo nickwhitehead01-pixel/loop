@@ -3,7 +3,6 @@ Post-session artifact generation.
 
 Called when a teacher ends a live session — generates:
 1. Per-pupil personalised summaries with understanding scores
-2. Auto-generated quiz questions from the transcript
 """
 from __future__ import annotations
 
@@ -81,7 +80,6 @@ async def _generate_pupil_summary(
             messages=[{"role": "user", "content": prompt}],
             model=settings.ollama_model_teacher,
         )
-        # Parse JSON from response
         start = raw.find("{")
         end = raw.rfind("}") + 1
         if start != -1 and end > start:
@@ -114,7 +112,6 @@ async def generate_session_artifacts(session_id: int) -> None:
     """
     async with AsyncSessionLocal() as db:
         try:
-            # Load session info
             result = await db.execute(
                 select(LessonSession).where(LessonSession.id == session_id)
             )
@@ -123,18 +120,17 @@ async def generate_session_artifacts(session_id: int) -> None:
                 logger.error("Session %d not found for artifact generation", session_id)
                 return
 
-            # Calculate duration
             duration_seconds = 0
             if session.started_at and session.ended_at:
                 duration_seconds = int((session.ended_at - session.started_at).total_seconds())
 
-            # Get transcript
             transcript = await _get_transcript_text(session_id, db)
             if not transcript:
                 logger.info("No transcript for session %d, skipping artifacts", session_id)
                 return
 
-            # Find all pupils who participated (had conversations in this session)
+            # Scope to pupils who actually chatted — not all enrolled pupils may
+            # have been active, and we only generate summaries where there is data.
             pupil_result = await db.execute(
                 select(Conversation.pupil_id)
                 .where(Conversation.session_id == session_id)
@@ -142,9 +138,9 @@ async def generate_session_artifacts(session_id: int) -> None:
             )
             pupil_ids = [r[0] for r in pupil_result.all()]
 
-            # Generate per-pupil summaries
+            # One LLM call per pupil — personalised rather than a shared class summary
+            # so each pupil's confusion points and progress are kept private.
             for pupil_id in pupil_ids:
-                # Get this pupil's messages during the session
                 msg_result = await db.execute(
                     select(Message.content)
                     .join(Conversation, Message.conversation_id == Conversation.id)
@@ -164,7 +160,7 @@ async def generate_session_artifacts(session_id: int) -> None:
 
             await db.commit()
             logger.info(
-                "Session %d artifacts generated: quiz + %d pupil summaries",
+                "Session %d artifacts generated: %d pupil summaries",
                 session_id, len(pupil_ids),
             )
 

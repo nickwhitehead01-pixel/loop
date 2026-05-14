@@ -86,7 +86,7 @@ class PupilMemoryResponse(BaseModel):
 
 # ── Pupil / Teacher analytics ──────────────────────────────────────────────
 
-class StudentProgress(BaseModel):
+class PupilProgress(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     pupil_id: int
