@@ -6,6 +6,7 @@ search         — embed a query, return top-k chunk texts
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import logging
 from io import BytesIO
@@ -281,19 +282,25 @@ def _chunk_text_located(texts_with_locations: list[tuple[str, int]]) -> list[tup
 async def ingest_lesson(
     lesson_id: int,
     file_bytes: bytes,
-    db: AsyncSession,
     filename: str = "upload.pdf",
 ) -> int:
     """
     Parse *file_bytes*, embed all text chunks, and store into lesson_chunks.
     Returns the number of text chunks stored.
 
-    Image description is intentionally NOT done here — it is deferred to
-    ingest_lesson_images() which should be called as a background task after
-    this function returns, so the upload endpoint can respond immediately.
+    Manages its own DB session so it can be called as a background task from
+    the upload endpoint, letting the HTTP response return immediately after
+    the Lesson record is created (the UI's "Reading file…" stage covers this).
+
+    Text extraction (pypdf/pptx) and ChromaDB writes are run in a thread
+    pool so they don't block the async event loop.
     """
-    # Located text extraction — each chunk carries its slide/page number
-    located_text_chunks = _chunk_text_located(_extract_located(file_bytes, filename))
+    from app.core.database import AsyncSessionLocal
+
+    # CPU-bound extraction runs off the event loop
+    located_text_chunks = await asyncio.to_thread(
+        lambda: _chunk_text_located(_extract_located(file_bytes, filename))
+    )
     if not located_text_chunks:
         return 0
 
@@ -303,40 +310,46 @@ async def ingest_lesson(
 
     vectors = await embed_batch(text_chunks)
 
-    for i, chunk_text in enumerate(text_chunks):
-        db.add(LessonChunk(lesson_id=lesson_id, chunk_index=i, content=chunk_text))
+    async with AsyncSessionLocal() as db:
+        for i, chunk_text in enumerate(text_chunks):
+            db.add(LessonChunk(lesson_id=lesson_id, chunk_index=i, content=chunk_text))
 
-    await db.flush()
+        await db.flush()
 
-    result = await db.execute(
-        select(LessonChunk.id, LessonChunk.content, LessonChunk.chunk_index)
-        .where(LessonChunk.lesson_id == lesson_id)
-        .order_by(LessonChunk.chunk_index)
-    )
-    rows = result.all()
+        result = await db.execute(
+            select(LessonChunk.id, LessonChunk.content, LessonChunk.chunk_index)
+            .where(LessonChunk.lesson_id == lesson_id)
+            .order_by(LessonChunk.chunk_index)
+        )
+        rows = result.all()
 
-    col = lesson_chunks_col()
-    chroma_ids: list[str] = []
-    chroma_embeddings: list[list[float]] = []
-    chroma_documents: list[str] = []
-    chroma_metadatas: list[dict] = []
+        col = lesson_chunks_col()
+        chroma_ids: list[str] = []
+        chroma_embeddings: list[list[float]] = []
+        chroma_documents: list[str] = []
+        chroma_metadatas: list[dict] = []
 
-    for (chunk_id, chunk_content, chunk_index), vector in zip(rows, vectors):
-        chroma_ids.append(str(chunk_id))
-        chroma_embeddings.append(vector)
-        chroma_documents.append(chunk_content)
-        chroma_metadatas.append({
-            "lesson_id": str(lesson_id),
-            "chunk_index": chunk_index,
-            "slide_number": str(text_slide_numbers[chunk_index]),
-        })
+        for (chunk_id, chunk_content, chunk_index), vector in zip(rows, vectors):
+            chroma_ids.append(str(chunk_id))
+            chroma_embeddings.append(vector)
+            chroma_documents.append(chunk_content)
+            chroma_metadatas.append({
+                "lesson_id": str(lesson_id),
+                "chunk_index": chunk_index,
+                "slide_number": str(text_slide_numbers[chunk_index]),
+            })
 
-    col.add(
-        ids=chroma_ids,
-        embeddings=chroma_embeddings,
-        documents=chroma_documents,
-        metadatas=chroma_metadatas,
-    )
+        # Sync ChromaDB write — run in thread pool to avoid blocking the loop
+        await asyncio.to_thread(
+            lambda: col.add(
+                ids=chroma_ids,
+                embeddings=chroma_embeddings,
+                documents=chroma_documents,
+                metadatas=chroma_metadatas,
+            )
+        )
+
+        await db.commit()
 
     logger.info("lesson_id=%s ingested: %d text chunk(s)", lesson_id, len(rows))
     return len(rows)
@@ -417,11 +430,13 @@ async def ingest_lesson_images(
                 "source": "image",
             })
 
-        col.add(
-            ids=chroma_ids,
-            embeddings=chroma_embeddings,
-            documents=chroma_documents,
-            metadatas=chroma_metadatas,
+        await asyncio.to_thread(
+            lambda: col.add(
+                ids=chroma_ids,
+                embeddings=chroma_embeddings,
+                documents=chroma_documents,
+                metadatas=chroma_metadatas,
+            )
         )
         await db.commit()
 

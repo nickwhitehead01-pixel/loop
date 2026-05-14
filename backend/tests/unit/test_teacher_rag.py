@@ -1,6 +1,7 @@
 """
 Unit tests for teacher_rag.py — summarise_lesson, process_lesson.
 """
+import asyncio
 from datetime import datetime
 from unittest.mock import AsyncMock, patch
 
@@ -139,10 +140,10 @@ class TestSummariseLesson:
 class TestProcessLesson:
     """Tests for the process_lesson function."""
 
-    async def test_process_lesson_embeds_chunks(
+    async def test_process_lesson_fires_background_ingest(
         self, async_db: AsyncSession, mock_ollama_embed, sample_pdf_bytes
     ):
-        """Test process_lesson creates chunks and embeds them."""
+        """Test process_lesson schedules ingest as a background task."""
         from app.agents.teacher_rag import process_lesson
 
         teacher = User(name="Test Teacher", role=Role.teacher)
@@ -161,8 +162,11 @@ class TestProcessLesson:
             mock_ingest.return_value = 5
 
             chunk_count = await process_lesson(
-                lesson.id, sample_pdf_bytes, async_db, filename="test.pdf"
+                lesson.id, sample_pdf_bytes, filename="test.pdf"
             )
+            # Let the event loop run the background task
+            await asyncio.sleep(0)
 
-        assert chunk_count == 5
+        # process_lesson returns 0 immediately; actual ingestion is backgrounded
+        assert chunk_count == 0
         assert mock_ingest.called

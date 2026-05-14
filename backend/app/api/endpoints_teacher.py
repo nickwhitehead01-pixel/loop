@@ -269,16 +269,15 @@ async def upload_lesson(
             original_filename=filename,
             file_path=str(dest),
         ))
-        try:
-            await process_lesson(lesson.id, content, db, filename=filename)
-        except Exception:
-            logger.exception("Failed to process lesson file %s", filename)
-            raise HTTPException(
-                status_code=500,
-                detail=f"Failed to process {filename}",
-            )
 
+    # Commit lesson + file records before firing background tasks so the
+    # lesson row exists in the DB when ingest_lesson opens its own session.
     await db.commit()
+
+    # Fire text + image ingestion as background tasks — the endpoint returns
+    # immediately and the UI's "Reading file…" stage covers the async wait.
+    for filename, content in file_entries:
+        asyncio.create_task(process_lesson(lesson.id, content, filename=filename))
 
     await db.refresh(lesson)
 

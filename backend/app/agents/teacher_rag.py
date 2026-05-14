@@ -43,25 +43,35 @@ RULES:
 # Public API
 # ---------------------------------------------------------------------------
 
+async def _ingest_all(lesson_id: int, file_bytes: bytes, filename: str) -> None:
+    """Background coroutine: text ingestion then image ingestion, in order.
+
+    Running them sequentially here (rather than concurrently) preserves the
+    chunk_offset contract — image chunks get indices that follow the last
+    text chunk index so no index values collide.
+    """
+    try:
+        n_text = await ingest_lesson(lesson_id, file_bytes, filename=filename)
+        await ingest_lesson_images(lesson_id, file_bytes, filename=filename, chunk_offset=n_text)
+    except Exception:
+        logger.exception("Background ingestion failed for lesson %d", lesson_id)
+
+
 async def process_lesson(
     lesson_id: int,
     pdf_bytes: bytes,
-    db: AsyncSession,
+    db: AsyncSession | None = None,  # kept for API compatibility, no longer used
     filename: str = "upload.pdf",
 ) -> int:
     """
-    Parse *pdf_bytes* (PDF, DOCX, PPTX, or TXT), embed all 500/50-token text chunks,
-    and store them in lesson_chunks. Returns the number of text chunks created.
+    Fire text + image ingestion as a background task and return immediately.
 
-    Image description is fired as a background asyncio task so the upload
-    endpoint returns immediately after text ingestion completes.
+    The upload endpoint can commit its DB transaction and respond to the
+    client straight away; the UI "Reading file…" stage covers the async wait.
+    Returns 0 — actual chunk count is logged inside _ingest_all.
     """
-    n_text = await ingest_lesson(lesson_id, pdf_bytes, db, filename=filename)
-    # Fire image description in the background — never blocks the upload response
-    asyncio.create_task(
-        ingest_lesson_images(lesson_id, pdf_bytes, filename=filename, chunk_offset=n_text)
-    )
-    return n_text
+    asyncio.create_task(_ingest_all(lesson_id, pdf_bytes, filename))
+    return 0
 
 
 async def summarise_lesson(
