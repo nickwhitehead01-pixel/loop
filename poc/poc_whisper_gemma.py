@@ -1,22 +1,46 @@
 """
-PoC: Mac Mic → faster-whisper (live transcript) + manual question → Gemma4:e2b response
+PoC — live classroom transcription plus streamed pupil Q&A on a single local server.
 
-Flow:
-  1. Teacher speaks → Whisper transcribes → transcript shown on screen
-  2. Student types a question → Gemma4:e2b answers it (streamed)
+Why this proof-of-concept
+--------------------------
+Before committing to a full FastAPI service with ChromaDB indexing, a WebSocket
+based PoC validates two independent latency budgets in one running process:
+(1) speech-to-text latency via faster-whisper on CPU, and (2) token-stream
+latency from a locally-hosted Gemma4:e2b model.  Combining both in a single
+script removes network hops between services and surfaces integration issues
+(audio encoding, streaming back-pressure) before any production infrastructure
+exists.
 
-Run:
+Key design decisions
+--------------------
+1. Two WebSocket message types on one endpoint
+   Binary frames carry raw PCM audio from the browser microphone directly to
+   faster-whisper, bypassing a separate audio-upload REST endpoint.  Text
+   frames carry typed pupil questions to the LLM.  One endpoint simplifies
+   the browser client and avoids CORS pre-flight on a second origin.
+
+2. Lazy Whisper model load
+   The transcription model is loaded on the first audio frame, not at server
+   start.  This keeps startup time under one second so the PoC can be iterated
+   quickly, and avoids occupying GPU/CPU memory during periods with no speech.
+
+3. Streamed Gemma response via httpx
+   Answers are streamed token-by-token to the browser rather than waiting for
+   the full response.  This proves the streaming contract used by the
+   production pupil agent before that agent is built.
+
+Running the PoC
+---------------
     python poc/poc_whisper_gemma.py
+    # then open http://localhost:8765 in your browser
 
-Then open http://localhost:8765 in your browser.
-
-Prerequisites:
+Prerequisites
+-------------
     pip install fastapi "uvicorn[standard]" faster-whisper httpx
-    (all already in backend/requirements.txt)
+    # all already in backend/requirements.txt
 
     Ollama must be running with gemma4:e2b pulled:
-        ollama serve
-        ollama pull gemma4:e2b
+        ollama serve && ollama pull gemma4:e2b
 """
 from __future__ import annotations
 

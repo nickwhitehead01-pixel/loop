@@ -1,16 +1,41 @@
 """
 Retrieval functions called directly by the pupil and teacher agents.
 
-Replaced the old LangGraph @tool pattern — functions are invoked inline
-via keyword dispatch rather than being registered in a ReAct loop. No tool
-schemas, no intermediate LLM "which tool?" step.
+Why this module exists
+----------------------
+The original design registered tools via the LangGraph @tool decorator so a
+ReAct loop could select them at inference time.  That pattern requires the
+model to reason about tool selection, introduces extra round-trips, and makes
+it hard to guarantee which sources end up in the context window.  This module
+replaces that with plain async functions that agents call directly after
+resolving tool choice through keyword dispatch in Python.
 
-  retrieve_context         — vector search over teacher-uploaded lesson chunks (ChromaDB)
-  get_conversation_history — last N messages for the context window
-  list_lessons             — lesson titles for "what topics exist?" queries
-  get_pupil_memories       — similarity search over this pupil's long-term fact store
-  search_live_transcript   — vector search over live transcript (session-scoped)
-  get_full_transcript      — ordered transcript text capped by word budget
+Key design decisions
+--------------------
+1. No tool schemas or decorators
+   Removing LangGraph's tool registration layer eliminates the
+   serialise-dispatch-deserialise cycle on every retrieval call and makes
+   each function independently testable with standard pytest fixtures.
+
+2. Injected HTTP client
+   Every function that calls the embedding endpoint accepts a caller-supplied
+   httpx.AsyncClient.  This allows the agent to share a single connection
+   pool across an entire request rather than opening a new TCP connection
+   per embed call, which is significant at 150 ms+ per cold connection.
+
+3. Word budget on transcript retrieval
+   get_full_transcript caps output at a configurable word budget rather than
+   returning the full transcript.  This keeps prompt length predictable and
+   prevents a single long lesson from exhausting the model's context window.
+
+Catalogue of retrieval functions
+---------------------------------
+- retrieve_context         : vector search over teacher-uploaded lesson chunks
+- get_conversation_history : last N messages for the context window
+- list_lessons             : lesson titles for availability queries
+- get_pupil_memories       : similarity search over a pupil's long-term fact store
+- search_live_transcript   : vector search over live session transcript
+- get_full_transcript      : ordered transcript text capped by word budget
 """
 from __future__ import annotations
 

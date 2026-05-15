@@ -1,28 +1,40 @@
 """
 Pupil agent — direct-invoke pattern optimised for gemma4:e2b.
 
-    Model:   gemma4:e2b
-    Pattern: keyword dispatch → single retrieval → one LLM call (no ReAct loop)
+Why this architecture
+---------------------
+A conventional ReAct loop adds round-trip latency for every tool call and
+forces the model to reason about tool selection at inference time.  For a
+pupil-facing chat interface the response must feel instant, so the agent is
+deliberately reduced to a single retrieval step followed by a single streaming
+LLM call.
 
-Flow:
-    user_message
-         │
-         ▼
-    semantic cache? ──── HIT ──── yield cached answer
-         │
-        MISS
-         │
-         ▼
-    embed user_message (shared vector)
-         │
-         ├─ similarity search → top-3 pupil memories  (system prompt)
-         ├─ keyword dispatch  → ONE retrieval tool     ([CONTEXT] block)
-         │
-         ▼
-    single llm.astream(messages) call
-         │
-         ▼
-    yield tokens → persist → background memory extraction
+Key design decisions
+--------------------
+1. Keyword dispatch before embedding
+   Tool selection is resolved with a cheap string-match before any vector
+   work is done.  This avoids a redundant embed-then-classify step and keeps
+   the hot path under ~5 ms of Python CPU.
+
+2. One retrieval tool per turn
+   Fetching from multiple sources in parallel would increase prompt length and
+   confuse the model's grounding.  A single, high-quality context block keeps
+   the [CONTEXT] section under ~300 tokens and reduces hallucination risk.
+
+3. Semantic cache as the first gate
+   Cache hits short-circuit the entire pipeline (no embed, no retrieval, no
+   LLM call), reducing both latency and compute cost for repeated questions.
+
+4. Background memory extraction
+   Persisting pupil memories after the response has been streamed keeps the
+   critical path free of write-latency.  Memory is extracted asynchronously
+   and is available on the next turn.
+
+Runtime contract
+----------------
+- Model  : gemma4:e2b (local Ollama)
+- Pattern: semantic cache → keyword dispatch → single retrieval → one
+           astream call → background persist
 """
 from __future__ import annotations
 

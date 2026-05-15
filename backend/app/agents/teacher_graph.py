@@ -1,13 +1,44 @@
 """
-Teacher agent — simplified direct tool invocation pattern.
+Teacher agent — direct tool invocation pattern optimised for gemma4:e2b.
 
-    Model:   gemma4:e2b
-    Tools:   Direct invocation based on user message keywords
-             get_lesson_summaries | search_lesson_content | get_class_analytics
-             | get_student_profile | get_teacher_memories | search_transcript
+Why this architecture
+---------------------
+A ReAct loop gives the model control over which tools to call and in what
+order.  For a teacher-facing assistant the tradeoff is unfavourable: the
+extra LLM round-trips add latency the teacher notices, and the model
+sometimes skips tools that contain the most relevant data.  By resolving
+tool selection in Python (keyword dispatch) before the LLM is ever invoked,
+we guarantee that query results are always present in the context.
 
-Simpler than ReAct: parse user message → call appropriate tools → include results
-in context → invoke LLM once. Guarantees tool results are incorporated into response.
+Key design decisions
+--------------------
+1. Keyword dispatch over ReAct
+   Tool selection is a cheap string-match in Python, not an LLM inference
+   step.  This eliminates one full generate-parse cycle per message and
+   makes tool invocation deterministic and auditable.
+
+2. Parallel tool fetches where possible
+   Independent data sources (analytics, memories, lesson content) are
+   fetched concurrently with asyncio.gather, keeping wall-clock latency
+   close to the slowest single query rather than their sum.
+
+3. Single LLM call with pre-populated context
+   All retrieved data is assembled into a [DATA] block before the model
+   is called once.  The model's only job is synthesis and communication,
+   not tool orchestration — which suits smaller models like gemma4:e2b.
+
+4. Background memory extraction
+   Teacher-preference facts are persisted after the response streams,
+   keeping the critical path free of write latency and ensuring memories
+   are available on the next turn without blocking the current one.
+
+Runtime contract
+----------------
+- Model  : gemma4:e2b (local Ollama), temperature 0.4 for factual accuracy
+- Tools  : get_lesson_summaries, search_lesson_content, get_class_analytics,
+           get_student_profile, get_teacher_memories, search_transcript
+- Pattern: keyword dispatch → parallel fetch → single astream call →
+           background memory persist
 """
 from __future__ import annotations
 
