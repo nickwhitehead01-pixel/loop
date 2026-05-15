@@ -33,6 +33,31 @@ logging.basicConfig(
 )
 
 
+async def _close_stale_sessions() -> None:
+    """Mark any live/open sessions as ended on startup.
+
+    Active transcription cannot survive a backend restart — WebSocket
+    connections are gone, Whisper is no longer running — so leaving sessions
+    in 'live' or 'open' would permanently show stale entries in the pupil app.
+    """
+    from datetime import datetime, timezone
+    from sqlalchemy import update
+    from app.models.domain import LessonSession, SessionStatus
+
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(
+            update(LessonSession)
+            .where(LessonSession.status.in_([SessionStatus.live, SessionStatus.open]))
+            .values(status=SessionStatus.ended, ended_at=datetime.now(timezone.utc))
+        )
+        if result.rowcount:
+            logger.info(
+                "Closed %d stale session(s) left open from a previous run",
+                result.rowcount,
+            )
+        await db.commit()
+
+
 async def _seed_default_users() -> None:
     """Ensure a default teacher (id=1) and a default pupil (id=2) exist."""
     from sqlalchemy import select, text
@@ -71,6 +96,9 @@ async def lifespan(app: FastAPI):
 
     # Seed default users (auth is deferred — v1 uses fixed IDs)
     await _seed_default_users()
+
+    # Close any sessions that were left open by a previous backend process
+    await _close_stale_sessions()
 
     healthy = await ollama_client.health_check()
     if healthy:

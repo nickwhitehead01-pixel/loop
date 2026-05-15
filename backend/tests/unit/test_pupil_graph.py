@@ -100,7 +100,7 @@ class TestBuildSystemPrompt:
         assert "supportive personal AI tutor" in prompt
         # No memory / context blocks should appear
         assert "What you know" not in prompt
-        assert "[CONTEXT]" not in prompt
+        assert "\n[CONTEXT]\n" not in prompt
 
     def test_with_memories_includes_memory_block(self):
         memories = ["struggles with long division", "prefers worked examples"]
@@ -139,3 +139,20 @@ class TestBuildSystemPrompt:
     def test_empty_memories_list_omits_memory_block(self):
         prompt = _build_system_prompt(memories=[], context="Some context.")
         assert "What you know" not in prompt
+
+    def test_lesson_subject_includes_subject_block(self):
+        prompt = _build_system_prompt(memories=[], context="", lesson_subject="The Water Cycle")
+        assert "[LESSON SUBJECT]" in prompt
+        assert "The Water Cycle" in prompt
+
+    def test_no_lesson_subject_omits_subject_block(self):
+        prompt = _build_system_prompt(memories=[], context="Some context.", lesson_subject=None)
+        assert "[LESSON SUBJECT]" not in prompt
+
+    def test_subject_block_appears_before_context_block(self):
+        prompt = _build_system_prompt(
+            memories=[],
+            context="Water evaporates when heated.",
+            lesson_subject="The Water Cycle",
+        )
+        assert prompt.index("[LESSON SUBJECT]") < prompt.index("\n[CONTEXT]\n")

@@ -99,7 +99,8 @@ def _dispatch_tool(user_message: str, session_id: int | None) -> str:
 # ---------------------------------------------------------------------------
 
 _BASE_SYSTEM = """You are a supportive personal AI tutor for a pupil with special educational needs.
-Use the CONTEXT block provided to ground your answers in the lesson material.
+A [CONTEXT] block containing lesson material will be provided — use it to anchor your answers to what has been taught.
+If the lesson material alone does not fully answer the question, draw on your broader knowledge of the lesson subject to explain or elaborate. Do not introduce topics outside the lesson subject.
 Be clear, patient, encouraging, and concise.
 Personalise your approach using the pupil facts listed below."""
 
@@ -108,6 +109,7 @@ def _build_system_prompt(
     memories: list[str],
     context: str,
     current_slide: "_slide_sync.SlidePosition | None" = None,
+    lesson_subject: str | None = None,
 ) -> str:
     parts = [_BASE_SYSTEM]
     if memories:
@@ -119,6 +121,8 @@ def _build_system_prompt(
             f"The teacher is currently on slide {current_slide.slide_number} "
             f"of '{current_slide.lesson_title}'."
         )
+    if lesson_subject:
+        parts.append(f"\n[LESSON SUBJECT]\nThis lesson is about: {lesson_subject}. Stay within this subject area.")
     if context:
         parts.append(f"\n[CONTEXT]\n{context}")
     return "\n".join(parts)
@@ -234,19 +238,20 @@ async def run_pupil_agent(
     # _query_memories uses ChromaDB (sync, runs in thread pool).
     # get_conversation_history_func and the lesson query use the same DB session
     # but are both lightweight SELECTs that queue safely on the aiosqlite backend.
-    async def _get_active_lesson_id() -> int | None:
+    async def _get_active_lesson_info() -> tuple[int | None, str | None]:
         if session_id is None:
-            return None
+            return (None, None)
         from app.models.domain import Lesson as _Lesson
         result = await db.execute(
-            select(_Lesson.id).where(_Lesson.session_id == session_id)
+            select(_Lesson.id, _Lesson.title).where(_Lesson.session_id == session_id)
         )
-        return result.scalar_one_or_none()
+        row = result.one_or_none()
+        return (row.id, row.title) if row else (None, None)
 
-    prior_memories, history, active_lesson_id = await asyncio.gather(
+    prior_memories, history, (active_lesson_id, lesson_subject) = await asyncio.gather(
         asyncio.get_event_loop().run_in_executor(None, _query_memories),
         get_conversation_history_func(conversation_id, db),
-        _get_active_lesson_id(),
+        _get_active_lesson_info(),
     )
 
     context = ""
@@ -291,10 +296,17 @@ async def run_pupil_agent(
     except Exception:
         logger.exception("Retrieval failed for tool %s — continuing without context", tool_name)
 
+    if not context and lesson_subject:
+        context = (
+            f"No specific lesson material was found for this question. "
+            f"Answer using your general knowledge of: {lesson_subject}."
+        )
+
     system_prompt = _build_system_prompt(
         prior_memories,
         context,
         current_slide=_slide_sync.get_current_slide(session_id) if session_id else None,
+        lesson_subject=lesson_subject,
     )
 
     # --- Build message list (history already fetched in gather above) ---

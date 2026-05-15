@@ -1,6 +1,5 @@
 import 'dart:convert';
 
-import 'package:web_socket_channel/io.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 import '../../../core/networking/hub_uri.dart';
@@ -10,10 +9,7 @@ class ChatSocketClient {
 
   Stream<ChatStreamFrame> connect(Uri hubUri, int pupilId) {
     final Uri socketUri = wsUriForPupilChat(hubUri, pupilId);
-    _channel = IOWebSocketChannel.connect(
-      socketUri,
-      connectTimeout: const Duration(seconds: 3),
-    );
+    _channel = WebSocketChannel.connect(socketUri);
 
     return _channel!.stream.map((dynamic data) {
       final dynamic payload = jsonDecode(data as String);
