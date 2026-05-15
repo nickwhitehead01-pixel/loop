@@ -119,6 +119,13 @@ async def lifespan(app: FastAPI):
     await ollama_client.warmup_model(settings.ollama_model_pupil)
     await ollama_client.warmup_model(settings.ollama_embed_model)
 
+    # Pre-fill KV cache with each agent's static system prompt so every real
+    # request skips re-evaluating those tokens (saves ~30-60 % first-token latency).
+    from app.agents.pupil_graph import _BASE_SYSTEM as _PUPIL_SYSTEM
+    from app.agents.teacher_graph import _BASE_SYSTEM as _TEACHER_SYSTEM
+    await ollama_client.warmup_kv_cache(settings.ollama_model_pupil, _PUPIL_SYSTEM, label="pupil")
+    await ollama_client.warmup_kv_cache(settings.ollama_model_teacher, _TEACHER_SYSTEM, label="teacher")
+
     summary_task = asyncio.create_task(start_summary_worker())
     logger.info("Lesson summary worker task started")
 
