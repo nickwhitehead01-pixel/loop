@@ -59,6 +59,11 @@ logger = logging.getLogger(__name__)
 # The first matching bucket wins; default is retrieve_context (RAG).
 # ---------------------------------------------------------------------------
 
+# Maximum words per RAG/transcript chunk sent to the LLM.  Caps prompt-eval
+# cost without cutting off genuine content — 150 words per chunk is enough
+# to convey the key concept; 2 chunks keeps [CONTEXT] under ~300 tokens.
+_MAX_CHUNK_WORDS = 150
+
 _TRANSCRIPT_KEYWORDS = {"transcript", "said", "spoken", "recap", "everything", "audio", "recording"}
 _FULL_RECAP_KEYWORDS  = {"full recap", "entire lesson", "whole lesson", "everything said"}
 _LIST_KEYWORDS        = {"what lessons", "which lessons", "available lessons", "topics available", "list lessons"}
@@ -175,11 +180,16 @@ async def _extract_and_store_memories(
 # Module-level singleton — avoids constructing a new ChatOllama object on
 # every message. temperature=0.7: warmer than the teacher agent (0.4) so
 # tutoring responses feel natural and varied rather than robotic.
+# num_ctx=1536: caps Ollama's KV cache to the actual prompt ceiling.
+# Full prompt (base + memories + context + 4 history msgs + user) peaks at
+# ~870 tokens; 1536 fits it with safe headroom and cuts KV allocation vs
+# the previous 2048, reducing prompt-eval time on Apple Silicon.
 _llm = ChatOllama(
     model=settings.ollama_model_pupil,
     base_url=settings.ollama_base_url,
     temperature=0.7,
     streaming=True,
+    num_ctx=1536,
 )
 
 
@@ -269,6 +279,7 @@ async def run_pupil_agent(
                 query_kwargs["where"] = {"lesson_id": str(active_lesson_id)}
             results = col.query(**query_kwargs)
             rows = (results.get("documents") or [[]])[0]
+            rows = [" ".join(r.split()[:_MAX_CHUNK_WORDS]) for r in rows]
             context = "\n\n---\n\n".join(rows) if rows else ""
         elif tool_name == "search_transcript":
             # Pass shared vector directly — no second embed call
@@ -286,7 +297,8 @@ async def run_pupil_agent(
                 for doc, meta in zip(docs, metas):
                     ts_ms = int(meta.get("timestamp_ms", 0))
                     mins, secs = divmod(ts_ms // 1000, 60)
-                    parts.append(f"[{mins:02d}:{secs:02d}] {doc}")
+                    truncated = " ".join(doc.split()[:_MAX_CHUNK_WORDS])
+                    parts.append(f"[{mins:02d}:{secs:02d}] {truncated}")
                 context = "\n\n".join(parts)
         elif tool_name == "get_full_transcript":
             context = await get_full_transcript_func(session_id, db)
@@ -310,7 +322,7 @@ async def run_pupil_agent(
     )
 
     # --- Build message list (history already fetched in gather above) ---
-    recent = history[:-1][-6:]
+    recent = history[:-1][-4:]
     lc_messages: list[BaseMessage] = [SystemMessage(content=system_prompt)]
     for m in recent:
         cls = HumanMessage if m["role"] == "user" else AIMessage

@@ -113,6 +113,12 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.exception("Whisper warm-up failed; live transcription may have cold-start delay")
 
+    # Warm up Gemma and the embed model so the first pupil message does not pay
+    # Ollama's cold-start model-load latency (~3-8 s).  keep_alive=-1 pins both
+    # models in memory for the server's lifetime — no 5-minute idle eviction.
+    await ollama_client.warmup_model(settings.ollama_model_pupil)
+    await ollama_client.warmup_model(settings.ollama_embed_model)
+
     summary_task = asyncio.create_task(start_summary_worker())
     logger.info("Lesson summary worker task started")
 
