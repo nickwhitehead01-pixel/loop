@@ -8,6 +8,7 @@ import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.domain import Lesson, User, Role
+from app.agents.teacher_graph import get_lesson_summaries_impl, TOOL_KEYWORDS
 
 
 @pytest.mark.unit
@@ -17,7 +18,7 @@ class TestGetLessonSummariesTool:
     async def test_get_lesson_summaries_with_search_term(
         self, db_with_teacher: tuple[AsyncSession, User]
     ):
-        """Test getting summaries by searching for a specific lesson title."""
+        """Test that all summaries for the teacher are returned."""
         db, teacher = db_with_teacher
 
         lessons = [
@@ -40,21 +41,16 @@ class TestGetLessonSummariesTool:
             db.add(lesson)
         await db.flush()
 
-        from app.agents.teacher_graph import _build_tools
-
-        tools = _build_tools(db, teacher.id)
-        get_lesson_summaries_tool = next(t for t in tools if t.name == "get_lesson_summaries")
-
-        result = await get_lesson_summaries_tool.ainvoke({"lesson_title": "quadratic"})
+        result = await get_lesson_summaries_impl(db, teacher.id)
 
         assert "Quadratic Equations" in result
         assert "ax² + bx + c = 0" in result
-        assert "Linear Functions" not in result
+        assert "Linear Functions" in result
 
     async def test_get_lesson_summaries_without_search_term(
         self, db_with_teacher: tuple[AsyncSession, User]
     ):
-        """Test listing all lesson summaries when no search term provided."""
+        """Test listing all lesson summaries."""
         db, teacher = db_with_teacher
 
         for i in range(3):
@@ -68,12 +64,7 @@ class TestGetLessonSummariesTool:
             db.add(lesson)
         await db.flush()
 
-        from app.agents.teacher_graph import _build_tools
-
-        tools = _build_tools(db, teacher.id)
-        get_lesson_summaries_tool = next(t for t in tools if t.name == "get_lesson_summaries")
-
-        result = await get_lesson_summaries_tool.ainvoke({})
+        result = await get_lesson_summaries_impl(db, teacher.id)
 
         assert "Lesson 0" in result
         assert "Lesson 1" in result
@@ -83,28 +74,12 @@ class TestGetLessonSummariesTool:
     async def test_get_lesson_summaries_returns_empty_if_no_match(
         self, db_with_teacher: tuple[AsyncSession, User]
     ):
-        """Test returns appropriate message when no lessons match search."""
+        """Test returns appropriate message when no lessons have summaries."""
         db, teacher = db_with_teacher
 
-        lesson = Lesson(
-            title="Algebra",
-            teacher_id=teacher.id,
-            file_path="/tmp/algebra.pdf",
-            summary="Algebra fundamentals.",
-            summary_generated_at=datetime.now(),
-        )
-        db.add(lesson)
-        await db.flush()
+        result = await get_lesson_summaries_impl(db, teacher.id)
 
-        from app.agents.teacher_graph import _build_tools
-
-        tools = _build_tools(db, teacher.id)
-        get_lesson_summaries_tool = next(t for t in tools if t.name == "get_lesson_summaries")
-
-        result = await get_lesson_summaries_tool.ainvoke({"lesson_title": "geometry"})
-
-        assert "No summary found" in result
-        assert "geometry" in result
+        assert "No lesson summaries available" in result
 
     async def test_get_lesson_summaries_skips_lessons_without_summaries(
         self, db_with_teacher: tuple[AsyncSession, User]
@@ -130,12 +105,7 @@ class TestGetLessonSummariesTool:
         db.add(lesson_without_summary)
         await db.flush()
 
-        from app.agents.teacher_graph import _build_tools
-
-        tools = _build_tools(db, teacher.id)
-        get_lesson_summaries_tool = next(t for t in tools if t.name == "get_lesson_summaries")
-
-        result = await get_lesson_summaries_tool.ainvoke({})
+        result = await get_lesson_summaries_impl(db, teacher.id)
 
         assert "Complete Lesson" in result
         assert "Incomplete Lesson" not in result
@@ -143,10 +113,10 @@ class TestGetLessonSummariesTool:
     async def test_get_lesson_summaries_truncates_preview(
         self, db_with_teacher: tuple[AsyncSession, User]
     ):
-        """Test that list view truncates summaries to 200 chars."""
+        """Test that list view truncates summaries to 300 chars."""
         db, teacher = db_with_teacher
 
-        long_summary = "x" * 300
+        long_summary = "x" * 400
 
         lesson = Lesson(
             title="Long Lesson",
@@ -158,37 +128,16 @@ class TestGetLessonSummariesTool:
         db.add(lesson)
         await db.flush()
 
-        from app.agents.teacher_graph import _build_tools
-
-        tools = _build_tools(db, teacher.id)
-        get_lesson_summaries_tool = next(t for t in tools if t.name == "get_lesson_summaries")
-
-        result = await get_lesson_summaries_tool.ainvoke({})
+        result = await get_lesson_summaries_impl(db, teacher.id)
 
         assert "..." in result
-        assert result.count("x") == 200
+        assert result.count("x") == 300
 
     async def test_get_lesson_summaries_tool_in_graph_context(
         self, db_with_teacher: tuple[AsyncSession, User]
     ):
-        """Test that tool is properly registered in the teacher graph."""
-        db, teacher = db_with_teacher
+        """Test that tool keywords are properly registered in the teacher graph."""
+        assert "get_lesson_summaries" in TOOL_KEYWORDS
+        assert "search_lesson_content" in TOOL_KEYWORDS
+        assert len(TOOL_KEYWORDS) >= 6
 
-        lesson = Lesson(
-            title="Graph Test Lesson",
-            teacher_id=teacher.id,
-            file_path="/tmp/test.pdf",
-            summary="Test summary for graph",
-            summary_generated_at=datetime.now(),
-        )
-        db.add(lesson)
-        await db.flush()
-
-        from app.agents.teacher_graph import _build_tools
-
-        tools = _build_tools(db, teacher.id)
-        tool_names = [t.name for t in tools]
-
-        assert "get_lesson_summaries" in tool_names
-        assert "search_lesson_content" in tool_names
-        assert len(tools) >= 6

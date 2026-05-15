@@ -17,6 +17,7 @@ Output shapes (also documented on the Lesson model):
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import uuid
@@ -210,7 +211,7 @@ async def generate_prompt_card_library(lesson_content: str) -> list[dict]:
     )
     parsed = _parse_list(raw, primary_key="cards")
 
-    cards: list[dict] = []
+    draft_cards: list[dict] = []
     for idx, item in enumerate(parsed[: _TARGET_PROMPT_CARD_COUNT[1]]):
         if not isinstance(item, dict):
             continue
@@ -222,24 +223,33 @@ async def generate_prompt_card_library(lesson_content: str) -> list[dict]:
         if not question or not triggers:
             continue
 
-        # Embed the concatenated triggers in one call — the matcher only
-        # needs a single embedding vector per card, and "trigger A. trigger B."
-        # captures all of them in one shot.
-        trigger_text = ". ".join(triggers)
-        try:
-            embedding = await ollama_client.embed(trigger_text)
-        except Exception:
-            logger.exception(
-                "[precompute] embedding failed for card triggers=%r — skipping",
-                triggers,
-            )
-            continue
-
-        cards.append({
-            "id": f"card_{uuid.uuid4().hex[:8]}",
+        draft_cards.append({
             "question": question,
             "triggers": triggers,
             "color": _COLORS[idx % len(_COLORS)],
+            "trigger_text": ". ".join(triggers),
+        })
+
+    if not draft_cards:
+        return []
+
+    # Embed all cards' trigger texts in a single batch call — much faster
+    # than one HTTP round-trip per card when we have 8-12 cards.
+    try:
+        embeddings = await ollama_client.embed_batch(
+            [c["trigger_text"] for c in draft_cards]
+        )
+    except Exception:
+        logger.exception("[precompute] batch embedding failed — skipping all cards")
+        return []
+
+    cards: list[dict] = []
+    for draft, embedding in zip(draft_cards, embeddings):
+        cards.append({
+            "id": f"card_{uuid.uuid4().hex[:8]}",
+            "question": draft["question"],
+            "triggers": draft["triggers"],
+            "color": draft["color"],
             "trigger_embedding": embedding,
         })
 
@@ -255,10 +265,17 @@ async def precompute_features(lesson_chunks: list[str]) -> tuple[list[dict], lis
 
     Raises on Gemma/embedding failure so the caller (worker) can decide
     whether to mark the lesson failed or retry on the next poll cycle.
+
+    Glossary and prompt-card generation are independent Gemma calls so we
+    fire both concurrently and await them together — roughly halves wall time
+    on single-GPU / single-CPU Ollama because the two requests queue back-to-
+    back rather than running strictly serially.
     """
     content = "\n\n".join(c for c in lesson_chunks if c.strip())
     if not content:
         return [], []
-    glossary = await generate_glossary(content)
-    prompt_cards = await generate_prompt_card_library(content)
+    glossary, prompt_cards = await asyncio.gather(
+        generate_glossary(content),
+        generate_prompt_card_library(content),
+    )
     return glossary, prompt_cards

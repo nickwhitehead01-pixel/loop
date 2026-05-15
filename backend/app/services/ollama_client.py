@@ -7,9 +7,12 @@ never imports httpx directly for LLM work.
 from __future__ import annotations
 
 import json
+import logging
 from typing import AsyncIterator
 
 import httpx
+
+logger = logging.getLogger(__name__)
 
 from app.core.config import settings
 
@@ -131,6 +134,37 @@ async def generate_full(
     async for token in generate_stream(messages, model, system, format=format):
         tokens.append(token)
     return "".join(tokens)
+
+
+async def warmup_model(model: str) -> None:
+    """Load *model* into Ollama memory and pin it for the server's lifetime.
+
+    Uses /api/embed for embedding models and /api/generate for LLM models,
+    with keep_alive=-1 so Ollama never evicts after the default 5-min timeout.
+    Swallows all exceptions so a slow or absent Ollama never aborts startup.
+    """
+    try:
+        # Try embed endpoint first (works for embedding models; LLMs return 400)
+        r = await get_client().post(
+            "/api/embed",
+            json={"model": model, "input": "", "keep_alive": -1},
+            timeout=120.0,
+        )
+        if r.status_code == 400:
+            # Not an embedding model — fall back to generate endpoint
+            r = await get_client().post(
+                "/api/generate",
+                json={"model": model, "prompt": "", "keep_alive": -1},
+                timeout=120.0,
+            )
+        r.raise_for_status()
+        logger.info("Ollama model warm-up complete: %s (pinned in memory)", model)
+    except Exception:
+        logger.warning(
+            "Ollama model warm-up failed for %s — first request will pay cold-start latency",
+            model,
+            exc_info=True,
+        )
 
 
 # ---------------------------------------------------------------------------

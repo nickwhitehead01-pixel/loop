@@ -442,10 +442,6 @@ class _TranscriptPageState extends State<TranscriptPage> {
     if (!_historyLoaded) {
       return const Center(child: CircularProgressIndicator());
     }
-    // Waiting room: session is live but teacher hasn't spoken yet.
-    if (widget.session.isLive && _entries.isEmpty && _error == null) {
-      return const _WaitingRoom();
-    }
     // Two columns: teacher transcript on the left (with notebook gutter),
     // Class Helper conversation on the right. The pupil's chat is now a
     // permanent visual sidebar rather than a strip wedged underneath the
@@ -477,7 +473,7 @@ class _TranscriptPageState extends State<TranscriptPage> {
               padding: const EdgeInsets.only(top: 24),
               child: Text(
                 widget.session.isLive
-                    ? 'Listening for your teacher…'
+                    ? 'Waiting for your lesson to start…'
                     : 'No transcript was recorded for this lesson.',
                 style: LoopType.ui.copyWith(color: LoopColors.inkMuted),
               ),

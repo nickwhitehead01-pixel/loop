@@ -440,8 +440,8 @@ async def audio_stream(
             try:
                 result = await transcribe_chunk(audio_bytes)
             except Exception as e:
-                logger.warning("Transcription error: %s", e)
-                await websocket.send_json({"type": "error", "detail": str(e)})
+                logger.exception("Transcription error for session %d", session_id)
+                await websocket.send_json({"type": "error", "detail": "Transcription error — retrying"})
                 continue
 
             if not result.text:
@@ -568,13 +568,13 @@ async def audio_stream(
                         _generate_and_broadcast_tappable_terms(session_id, card_text)
                     )
         except Exception as flush_err:
-            logger.warning("Could not flush bucket on disconnect for session %d: %s", session_id, flush_err)
+            logger.warning("Could not flush bucket on disconnect for session %d", session_id, exc_info=True)
     except Exception as e:
-        logger.error("Audio stream error for session %d: %s", session_id, e)
+        logger.exception("Audio stream error for session %d", session_id)
         try:
             await flush_bucket()
         except Exception:
-            pass
+            logger.debug("Flush-on-error failed for session %d", session_id, exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -611,7 +611,7 @@ async def subscribe_transcript(
         try:
             await websocket.send_json({"type": "prompt_cards", "cards": latest_cards})
         except Exception:
-            pass
+            logger.debug("[subscribe] session=%d late-join prompt_cards send failed", session_id, exc_info=True)
 
     # Same for cumulative tappable terms so any historical chunk already in
     # the pupil's REST-loaded transcript can be wrapped with dotted underlines.
@@ -623,7 +623,7 @@ async def subscribe_transcript(
                 "terms": list(tappable_store.values()),
             })
         except Exception:
-            pass
+            logger.debug("[subscribe] session=%d late-join tappable_terms send failed", session_id, exc_info=True)
 
     try:
         # Keep connection alive; pupil only receives, doesn't send
@@ -640,8 +640,9 @@ async def subscribe_transcript(
         # still gets iterated by the broadcast loop until a send finally errors.
         subscribers.discard(websocket)
         logger.warning(
-            "[subscribe] session=%d ERROR %s -> total subscribers=%d",
-            session_id, exc, len(subscribers),
+            "[subscribe] session=%d ERROR -> total subscribers=%d",
+            session_id, len(subscribers),
+            exc_info=True,
         )
 
 
@@ -688,8 +689,9 @@ async def subscribe_teacher(
     except Exception as exc:
         subscribers.discard(websocket)
         logger.warning(
-            "[teacher-ws] session=%d ERROR %s -> total teacher subscribers=%d",
-            session_id, exc, len(subscribers),
+            "[teacher-ws] session=%d ERROR -> total teacher subscribers=%d",
+            session_id, len(subscribers),
+            exc_info=True,
         )
 
 

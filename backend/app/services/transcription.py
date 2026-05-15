@@ -93,7 +93,7 @@ def _transcribe_sync(audio_bytes: bytes) -> TranscriptionResult:
         best_of=1,
         temperature=0.0,
         language="en",
-        condition_on_previous_text=False,
+        condition_on_previous_text=False,  # prevents repetition-loop hallucinations when audio quality drops mid-lesson
         vad_filter=True,
         vad_parameters={"min_silence_duration_ms": 500},
         no_speech_threshold=0.45,

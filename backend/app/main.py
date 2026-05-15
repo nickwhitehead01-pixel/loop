@@ -9,8 +9,10 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from app.core.config import settings
 from app.core.database import Base, engine, AsyncSessionLocal, enable_wal
@@ -21,14 +23,47 @@ from app.services.transcription import get_model
 
 logger = logging.getLogger(__name__)
 
+# Configure logging before anything else.
+# force=True is required because Uvicorn registers its own handlers first;
+# without it basicConfig is a no-op.
+logging.basicConfig(
+    force=True,
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+
+
+async def _close_stale_sessions() -> None:
+    """Mark any live/open sessions as ended on startup.
+
+    Active transcription cannot survive a backend restart — WebSocket
+    connections are gone, Whisper is no longer running — so leaving sessions
+    in 'live' or 'open' would permanently show stale entries in the pupil app.
+    """
+    from datetime import datetime, timezone
+    from sqlalchemy import update
+    from app.models.domain import LessonSession, SessionStatus
+
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(
+            update(LessonSession)
+            .where(LessonSession.status.in_([SessionStatus.live, SessionStatus.open]))
+            .values(status=SessionStatus.ended, ended_at=datetime.now(timezone.utc))
+        )
+        if result.rowcount:
+            logger.info(
+                "Closed %d stale session(s) left open from a previous run",
+                result.rowcount,
+            )
+        await db.commit()
+
 
 async def _seed_default_users() -> None:
     """Ensure a default teacher (id=1) and a default pupil (id=2) exist."""
     from sqlalchemy import select, text
-    from app.models.domain import User, Role
+    from app.models.domain import User
 
     async with AsyncSessionLocal() as db:
-        # Check for teacher id=1
         result = await db.execute(select(User).where(User.id == 1))
         if result.scalar_one_or_none() is None:
             # Force id=1 via raw INSERT so the FK from lessons always resolves
@@ -56,14 +91,15 @@ async def lifespan(app: FastAPI):
         await conn.run_sync(Base.metadata.create_all)
     logger.info("Database tables created / verified")
 
-    # Initialise ChromaDB collections
     init_collections()
     logger.info("ChromaDB collections initialised")
 
     # Seed default users (auth is deferred — v1 uses fixed IDs)
     await _seed_default_users()
 
-    # Verify Ollama is reachable
+    # Close any sessions that were left open by a previous backend process
+    await _close_stale_sessions()
+
     healthy = await ollama_client.health_check()
     if healthy:
         logger.info("Ollama is reachable at %s", settings.ollama_base_url)
@@ -77,7 +113,12 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.exception("Whisper warm-up failed; live transcription may have cold-start delay")
 
-    # Start background lesson summary worker
+    # Warm up Gemma and the embed model so the first pupil message does not pay
+    # Ollama's cold-start model-load latency (~3-8 s).  keep_alive=-1 pins both
+    # models in memory for the server's lifetime — no 5-minute idle eviction.
+    await ollama_client.warmup_model(settings.ollama_model_pupil)
+    await ollama_client.warmup_model(settings.ollama_embed_model)
+
     summary_task = asyncio.create_task(start_summary_worker())
     logger.info("Lesson summary worker task started")
 
@@ -121,6 +162,43 @@ app.include_router(session_router)
 app.include_router(quiz_router)
 
 
+# ---------------------------------------------------------------------------
+# Global exception handlers
+# ---------------------------------------------------------------------------
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    """Catch-all for any unhandled exception — logs the full traceback and
+    returns a safe, non-disclosing 500 response body."""
+    logger.error(
+        "Unhandled exception: %s %s",
+        request.method,
+        request.url.path,
+        exc_info=exc,
+    )
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal server error"},
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    """Log request validation errors at WARNING with the full detail for
+    server-side diagnostics while returning the default 422 body."""
+    logger.warning(
+        "Request validation error: %s %s — %s",
+        request.method,
+        request.url.path,
+        exc.errors(),
+        exc_info=True,
+    )
+    return JSONResponse(
+        status_code=422,
+        content={"detail": exc.errors()},
+    )
+
+
 @app.get("/health")
 async def health():
     ollama_ok = await ollama_client.health_check()
@@ -139,16 +217,27 @@ from sqlalchemy import select
 from app.core.database import get_db
 from app.models.domain import User
 from app.models.schemas import UserCreate, UserResponse
+from sqlalchemy.exc import IntegrityError
 
 
 @app.post("/users", response_model=UserResponse)
 async def create_user(body: UserCreate, db: AsyncSession = Depends(get_db)):
-    user = User(name=body.name, role=body.role)
-    db.add(user)
-    await db.flush()
-    await db.refresh(user)
-    await db.commit()
-    return user
+    try:
+        user = User(name=body.name, role=body.role)
+        db.add(user)
+        await db.flush()
+        await db.refresh(user)
+        await db.commit()
+        return user
+    except IntegrityError as exc:
+        await db.rollback()
+        from fastapi import HTTPException
+        raise HTTPException(status_code=409, detail="A user with that name already exists") from exc
+    except Exception as exc:
+        await db.rollback()
+        logger.exception("Unexpected error creating user")
+        from fastapi import HTTPException
+        raise HTTPException(status_code=500, detail="Internal server error") from exc
 
 
 @app.get("/users", response_model=list[UserResponse])

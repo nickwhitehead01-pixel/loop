@@ -2,7 +2,6 @@ import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
-import 'package:web_socket_channel/io.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 import '../../../core/models/prompt_card.dart';
@@ -59,7 +58,6 @@ class TranscriptSocketClient {
   int _reconnectAttempt = 0;
   bool _closedByCaller = false;
 
-  static const Duration _connectTimeout = Duration(seconds: 5);
   static const Duration _maxBackoff = Duration(seconds: 16);
 
   void connect({
@@ -93,10 +91,7 @@ class TranscriptSocketClient {
 
     late WebSocketChannel channel;
     try {
-      channel = IOWebSocketChannel.connect(
-        socketUri,
-        connectTimeout: _connectTimeout,
-      );
+      channel = WebSocketChannel.connect(socketUri);
     } catch (e) {
       debugPrint('[TranscriptSocketClient] connect threw: $e');
       _scheduleReconnect();

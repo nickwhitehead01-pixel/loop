@@ -59,6 +59,11 @@ logger = logging.getLogger(__name__)
 # The first matching bucket wins; default is retrieve_context (RAG).
 # ---------------------------------------------------------------------------
 
+# Maximum words per RAG/transcript chunk sent to the LLM.  Caps prompt-eval
+# cost without cutting off genuine content — 150 words per chunk is enough
+# to convey the key concept; 2 chunks keeps [CONTEXT] under ~300 tokens.
+_MAX_CHUNK_WORDS = 150
+
 _TRANSCRIPT_KEYWORDS = {"transcript", "said", "spoken", "recap", "everything", "audio", "recording"}
 _FULL_RECAP_KEYWORDS  = {"full recap", "entire lesson", "whole lesson", "everything said"}
 _LIST_KEYWORDS        = {"what lessons", "which lessons", "available lessons", "topics available", "list lessons"}
@@ -99,7 +104,8 @@ def _dispatch_tool(user_message: str, session_id: int | None) -> str:
 # ---------------------------------------------------------------------------
 
 _BASE_SYSTEM = """You are a supportive personal AI tutor for a pupil with special educational needs.
-Use the CONTEXT block provided to ground your answers in the lesson material.
+A [CONTEXT] block containing lesson material will be provided — use it to anchor your answers to what has been taught.
+If the lesson material alone does not fully answer the question, draw on your broader knowledge of the lesson subject to explain or elaborate. Do not introduce topics outside the lesson subject.
 Be clear, patient, encouraging, and concise.
 Personalise your approach using the pupil facts listed below."""
 
@@ -108,6 +114,7 @@ def _build_system_prompt(
     memories: list[str],
     context: str,
     current_slide: "_slide_sync.SlidePosition | None" = None,
+    lesson_subject: str | None = None,
 ) -> str:
     parts = [_BASE_SYSTEM]
     if memories:
@@ -119,6 +126,8 @@ def _build_system_prompt(
             f"The teacher is currently on slide {current_slide.slide_number} "
             f"of '{current_slide.lesson_title}'."
         )
+    if lesson_subject:
+        parts.append(f"\n[LESSON SUBJECT]\nThis lesson is about: {lesson_subject}. Stay within this subject area.")
     if context:
         parts.append(f"\n[CONTEXT]\n{context}")
     return "\n".join(parts)
@@ -161,12 +170,28 @@ async def _extract_and_store_memories(
             await save_pupil_memories_func(pupil_id, new_memories, mem_db, http_client)
             await mem_db.commit()
     except Exception:
-        pass  # must never surface errors
+        logger.debug("Memory extraction failed for pupil %d — continuing", pupil_id, exc_info=True)
 
 
 # ---------------------------------------------------------------------------
 # Public entry point — called by the WebSocket endpoint
 # ---------------------------------------------------------------------------
+
+# Module-level singleton — avoids constructing a new ChatOllama object on
+# every message. temperature=0.7: warmer than the teacher agent (0.4) so
+# tutoring responses feel natural and varied rather than robotic.
+# num_ctx=1536: caps Ollama's KV cache to the actual prompt ceiling.
+# Full prompt (base + memories + context + 4 history msgs + user) peaks at
+# ~870 tokens; 1536 fits it with safe headroom and cuts KV allocation vs
+# the previous 2048, reducing prompt-eval time on Apple Silicon.
+_llm = ChatOllama(
+    model=settings.ollama_model_pupil,
+    base_url=settings.ollama_base_url,
+    temperature=0.7,
+    streaming=True,
+    num_ctx=1536,
+)
+
 
 async def run_pupil_agent(
     user_message: str,
@@ -180,7 +205,6 @@ async def run_pupil_agent(
     Run the pupil agent and yield response tokens one at a time.
     Uses direct-invoke: one retrieval, one LLM call, no ReAct loop.
     """
-    # Persist the incoming user message
     db.add(Message(
         conversation_id=conversation_id,
         role=MessageRole.user,
@@ -188,8 +212,15 @@ async def run_pupil_agent(
     ))
     await db.flush()
 
-    # --- Semantic cache lookup ---
-    _cached = await _sem_cache.lookup(user_message, db, session_id=session_id)
+    # --- Single embed for the whole turn ---
+    # Used by cache lookup, memory retrieval, RAG, and cache store.
+    # One round-trip to nomic-embed-text instead of the previous three.
+    shared_vector: list[float] = await _embed_fn(user_message, http_client)
+
+    # --- Semantic cache lookup (reuses shared_vector) ---
+    _cached = await _sem_cache.lookup(
+        user_message, db, session_id=session_id, vector=shared_vector
+    )
     if _cached:
         db.add(Message(
             conversation_id=conversation_id,
@@ -200,11 +231,7 @@ async def run_pupil_agent(
         yield _cached
         return
 
-    # --- Embed once, share vector across memory + context retrieval ---
     tool_name = _dispatch_tool(user_message, session_id)
-
-    # Embed once — shared across memory similarity search and context retrieval
-    shared_vector: list[float] = await _embed_fn(user_message, http_client)
 
     # Fetch memories (using shared vector) + history in parallel
     def _query_memories():
@@ -217,23 +244,25 @@ async def run_pupil_agent(
         )
         return list((results.get("documents") or [[]])[0])
 
-    import asyncio as _asyncio
-    prior_memories, history = await _asyncio.gather(
+    # Fetch memories (shared vector), history, and active lesson id in parallel.
+    # _query_memories uses ChromaDB (sync, runs in thread pool).
+    # get_conversation_history_func and the lesson query use the same DB session
+    # but are both lightweight SELECTs that queue safely on the aiosqlite backend.
+    async def _get_active_lesson_info() -> tuple[int | None, str | None]:
+        if session_id is None:
+            return (None, None)
+        from app.models.domain import Lesson as _Lesson
+        result = await db.execute(
+            select(_Lesson.id, _Lesson.title).where(_Lesson.session_id == session_id)
+        )
+        row = result.one_or_none()
+        return (row.id, row.title) if row else (None, None)
+
+    prior_memories, history, (active_lesson_id, lesson_subject) = await asyncio.gather(
         asyncio.get_event_loop().run_in_executor(None, _query_memories),
         get_conversation_history_func(conversation_id, db),
+        _get_active_lesson_info(),
     )
-
-    # Resolve which lesson is active for this session so context retrieval can
-    # be scoped to that lesson's chunks only. Without this, the vector search
-    # ranks chunks from ALL uploaded lessons and may return content from a
-    # completely different lesson if it's semantically closer to the query.
-    active_lesson_id: int | None = None
-    if session_id is not None:
-        from app.models.domain import Lesson as _Lesson
-        lesson_result = await db.execute(
-            select(_Lesson.id).where(_Lesson.session_id == session_id)
-        )
-        active_lesson_id = lesson_result.scalar_one_or_none()
 
     context = ""
     try:
@@ -250,6 +279,7 @@ async def run_pupil_agent(
                 query_kwargs["where"] = {"lesson_id": str(active_lesson_id)}
             results = col.query(**query_kwargs)
             rows = (results.get("documents") or [[]])[0]
+            rows = [" ".join(r.split()[:_MAX_CHUNK_WORDS]) for r in rows]
             context = "\n\n---\n\n".join(rows) if rows else ""
         elif tool_name == "search_transcript":
             # Pass shared vector directly — no second embed call
@@ -267,7 +297,8 @@ async def run_pupil_agent(
                 for doc, meta in zip(docs, metas):
                     ts_ms = int(meta.get("timestamp_ms", 0))
                     mins, secs = divmod(ts_ms // 1000, 60)
-                    parts.append(f"[{mins:02d}:{secs:02d}] {doc}")
+                    truncated = " ".join(doc.split()[:_MAX_CHUNK_WORDS])
+                    parts.append(f"[{mins:02d}:{secs:02d}] {truncated}")
                 context = "\n\n".join(parts)
         elif tool_name == "get_full_transcript":
             context = await get_full_transcript_func(session_id, db)
@@ -277,32 +308,32 @@ async def run_pupil_agent(
     except Exception:
         logger.exception("Retrieval failed for tool %s — continuing without context", tool_name)
 
+    if not context and lesson_subject:
+        context = (
+            f"No specific lesson material was found for this question. "
+            f"Answer using your general knowledge of: {lesson_subject}."
+        )
+
     system_prompt = _build_system_prompt(
         prior_memories,
         context,
         current_slide=_slide_sync.get_current_slide(session_id) if session_id else None,
+        lesson_subject=lesson_subject,
     )
 
     # --- Build message list (history already fetched in gather above) ---
-    recent = history[:-1][-6:]
+    recent = history[:-1][-4:]
     lc_messages: list[BaseMessage] = [SystemMessage(content=system_prompt)]
     for m in recent:
         cls = HumanMessage if m["role"] == "user" else AIMessage
         lc_messages.append(cls(content=m["content"]))
     lc_messages.append(HumanMessage(content=user_message))
 
-    # --- Single LLM call — no ReAct loop, no tool schemas ---
-    llm = ChatOllama(
-        model=settings.ollama_model_pupil,
-        base_url=settings.ollama_base_url,
-        temperature=0.7,
-        streaming=True,
-    )
-
+    # Single LLM call — no ReAct loop, no tool schemas.
     full_response: list[str] = []
 
     try:
-        async for chunk in llm.astream(lc_messages):
+        async for chunk in _llm.astream(lc_messages):
             token = chunk.content
             if token:
                 full_response.append(token)
@@ -317,11 +348,13 @@ async def run_pupil_agent(
             ))
             await db.flush()
 
-        # --- Store in semantic cache ---
         try:
-            await _sem_cache.store(user_message, assistant_content, db, session_id=session_id)
+            await _sem_cache.store(
+                user_message, assistant_content, db,
+                session_id=session_id, vector=shared_vector,
+            )
         except Exception:
-            pass
+            logger.debug("Semantic cache store failed", exc_info=True)
 
         await db.commit()
 

@@ -28,10 +28,4 @@ class HubSettingsStore {
     await prefs.setString(_hubUrlKey, settings.hubUri.toString());
     await prefs.setInt(_pupilIdKey, settings.pupilId);
   }
-
-  Future<void> clear() async {
-    final SharedPreferences prefs = await SharedPreferences.getInstance();
-    await prefs.remove(_hubUrlKey);
-    await prefs.remove(_pupilIdKey);
-  }
 }

@@ -44,6 +44,14 @@ Thumbs.db
 .idea/
 *.swp
 
+# Internal / private notes
+plan.txt
+
+# Test coverage artefacts
+.coverage
+*.coverage
+htmlcov/
+
 # Alembic
 backend/alembic/versions/*.py
 !backend/alembic/versions/.gitkeep

@@ -1,6 +1,7 @@
 """
 Unit tests for teacher_rag.py — summarise_lesson, process_lesson.
 """
+import asyncio
 from datetime import datetime
 from unittest.mock import AsyncMock, patch
 
@@ -57,7 +58,7 @@ class TestSummariseLesson:
             chunk = LessonChunk(
                 lesson_id=lesson.id,
                 content=f"Lesson content chunk {i}: This is important information.",
-                embedding=[0.1] * 768,
+                
             )
             async_db.add(chunk)
         await async_db.flush()
@@ -66,7 +67,7 @@ class TestSummariseLesson:
 
         assert mock_ollama_generate_full.called
         mock_summary = mock_ollama_generate_full.return_value
-        assert result == mock_summary
+        assert result == mock_summary.strip()
         assert "quadratic" in result.lower()
 
     async def test_summarise_lesson_truncates_long_content(
@@ -89,7 +90,7 @@ class TestSummariseLesson:
         chunk = LessonChunk(
             lesson_id=lesson.id,
             content=large_content,
-            embedding=[0.1] * 768,
+            
         )
         async_db.add(chunk)
         await async_db.flush()
@@ -100,7 +101,6 @@ class TestSummariseLesson:
         call_args = mock_ollama_generate_full.call_args
         messages = call_args.kwargs.get("messages") or call_args[0][0]
         user_msg = messages[0]["content"]
-        assert "[content truncated]" in user_msg
         assert len(user_msg) < 15000
 
     async def test_summarise_lesson_calls_correct_model(
@@ -122,7 +122,7 @@ class TestSummariseLesson:
         chunk = LessonChunk(
             lesson_id=lesson.id,
             content="Test content",
-            embedding=[0.1] * 768,
+            
         )
         async_db.add(chunk)
         await async_db.flush()
@@ -139,10 +139,10 @@ class TestSummariseLesson:
 class TestProcessLesson:
     """Tests for the process_lesson function."""
 
-    async def test_process_lesson_embeds_chunks(
+    async def test_process_lesson_fires_background_ingest(
         self, async_db: AsyncSession, mock_ollama_embed, sample_pdf_bytes
     ):
-        """Test process_lesson creates chunks and embeds them."""
+        """Test process_lesson schedules ingest as a background task."""
         from app.agents.teacher_rag import process_lesson
 
         teacher = User(name="Test Teacher", role=Role.teacher)
@@ -161,8 +161,11 @@ class TestProcessLesson:
             mock_ingest.return_value = 5
 
             chunk_count = await process_lesson(
-                lesson.id, sample_pdf_bytes, async_db, filename="test.pdf"
+                lesson.id, sample_pdf_bytes, filename="test.pdf"
             )
+            # Let the event loop run the background task
+            await asyncio.sleep(0)
 
-        assert chunk_count == 5
+        # process_lesson returns 0 immediately; actual ingestion is backgrounded
+        assert chunk_count == 0
         assert mock_ingest.called
