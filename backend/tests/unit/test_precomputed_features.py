@@ -174,9 +174,9 @@ class TestGeneratePromptCardLibrary:
             return_value=raw_response,
         ):
             with patch(
-                "app.services.precomputed_features.ollama_client.embed",
+                "app.services.precomputed_features.ollama_client.embed_batch",
                 new_callable=AsyncMock,
-                return_value=embedding,
+                return_value=[embedding, embedding],
             ):
                 yield
 
@@ -218,29 +218,22 @@ class TestGeneratePromptCardLibrary:
             return_value=raw_response,
         ):
             with patch(
-                "app.services.precomputed_features.ollama_client.embed",
+                "app.services.precomputed_features.ollama_client.embed_batch",
                 new_callable=AsyncMock,
-                return_value=embedding,
+                return_value=[embedding],
             ):
                 result = await generate_prompt_card_library("Biology lesson.")
         assert len(result) == 1
         assert result[0]["question"] == "Why is grass green?"
 
-    async def test_embedding_failure_skips_card(self):
+    async def test_embedding_failure_returns_empty(self):
+        """embed_batch is all-or-nothing; any failure skips all cards."""
         raw_response = json.dumps({
             "cards": [
                 {"question": "Good question one?", "triggers": ["trigger1"]},
                 {"question": "Good question two?", "triggers": ["trigger2"]},
             ]
         })
-        call_count = 0
-
-        async def embed_side_effect(text):
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                raise RuntimeError("Embedding service unavailable")
-            return [0.1] * 768
 
         with patch(
             "app.services.precomputed_features.ollama_client.generate_full",
@@ -248,12 +241,12 @@ class TestGeneratePromptCardLibrary:
             return_value=raw_response,
         ):
             with patch(
-                "app.services.precomputed_features.ollama_client.embed",
-                side_effect=embed_side_effect,
+                "app.services.precomputed_features.ollama_client.embed_batch",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("Embedding service unavailable"),
             ):
                 result = await generate_prompt_card_library("Some lesson content.")
-        assert len(result) == 1
-        assert result[0]["question"] == "Good question two?"
+        assert result == []
 
 
 # ---------------------------------------------------------------------------
@@ -282,9 +275,9 @@ class TestPrecomputeFeatures:
             side_effect=lambda **kwargs: next(responses),
         ):
             with patch(
-                "app.services.precomputed_features.ollama_client.embed",
+                "app.services.precomputed_features.ollama_client.embed_batch",
                 new_callable=AsyncMock,
-                return_value=embedding,
+                return_value=[embedding],
             ):
                 glossary, cards = await precompute_features(["Lesson chunk about atoms."])
 

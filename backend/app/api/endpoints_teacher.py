@@ -386,6 +386,7 @@ async def get_lesson_detail(
         "file_path": lesson.file_path,
         "created_at": lesson.created_at,
         "summary": summary,
+        "summary_generated_at": lesson.summary_generated_at,
         "files": [
             {
                 "id": f.id,

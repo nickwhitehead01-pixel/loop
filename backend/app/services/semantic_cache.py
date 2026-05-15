@@ -9,6 +9,7 @@ retains metadata (question text, answer, hit_count) for analytics queries.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 
@@ -28,16 +29,20 @@ async def lookup(
     db: AsyncSession,
     session_id: int | None = None,
     threshold: float | None = None,
+    vector: list[float] | None = None,
 ) -> str | None:
     """Return cached answer if similarity >= threshold, else None.
 
     Increments `hit_count` on the SQLite row on a cache hit.
     If `session_id` is supplied, the lookup is scoped to that session only.
+    If *vector* is supplied it is used directly — no embed call is made,
+    saving a round-trip when the caller already has the embedding.
     """
     if threshold is None:
         threshold = settings.semantic_cache_threshold
 
-    vector = await ollama_client.embed(question)
+    if vector is None:
+        vector = await ollama_client.embed(question)
     col = semantic_cache_col()
 
     where_filter: dict | None = None
@@ -90,9 +95,14 @@ async def store(
     answer: str,
     db: AsyncSession,
     session_id: int | None = None,
+    vector: list[float] | None = None,
 ) -> None:
-    """Embed and persist a new question/answer pair in ChromaDB + SQLite."""
-    vector = await ollama_client.embed(question)
+    """Embed and persist a new question/answer pair in ChromaDB + SQLite.
+
+    If *vector* is supplied it is used directly — no embed call is made.
+    """
+    if vector is None:
+        vector = await ollama_client.embed(question)
 
     # Persist metadata row in SQLite for analytics
     cache_row = SemanticCache(
@@ -113,10 +123,12 @@ async def store(
     if session_id is not None:
         meta["session_id"] = str(session_id)
 
-    col.add(
-        ids=[str(uuid.uuid4())],
-        embeddings=[vector],
-        documents=[question],
-        metadatas=[meta],
+    await asyncio.to_thread(
+        lambda: col.add(
+            ids=[str(uuid.uuid4())],
+            embeddings=[vector],
+            documents=[question],
+            metadatas=[meta],
+        )
     )
     logger.info("Semantic cache STORE: %.60s", question)

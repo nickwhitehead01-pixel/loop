@@ -168,6 +168,17 @@ async def _extract_and_store_memories(
 # Public entry point — called by the WebSocket endpoint
 # ---------------------------------------------------------------------------
 
+# Module-level singleton — avoids constructing a new ChatOllama object on
+# every message. temperature=0.7: warmer than the teacher agent (0.4) so
+# tutoring responses feel natural and varied rather than robotic.
+_llm = ChatOllama(
+    model=settings.ollama_model_pupil,
+    base_url=settings.ollama_base_url,
+    temperature=0.7,
+    streaming=True,
+)
+
+
 async def run_pupil_agent(
     user_message: str,
     conversation_id: int,
@@ -187,8 +198,15 @@ async def run_pupil_agent(
     ))
     await db.flush()
 
-    # --- Semantic cache lookup ---
-    _cached = await _sem_cache.lookup(user_message, db, session_id=session_id)
+    # --- Single embed for the whole turn ---
+    # Used by cache lookup, memory retrieval, RAG, and cache store.
+    # One round-trip to nomic-embed-text instead of the previous three.
+    shared_vector: list[float] = await _embed_fn(user_message, http_client)
+
+    # --- Semantic cache lookup (reuses shared_vector) ---
+    _cached = await _sem_cache.lookup(
+        user_message, db, session_id=session_id, vector=shared_vector
+    )
     if _cached:
         db.add(Message(
             conversation_id=conversation_id,
@@ -199,10 +217,7 @@ async def run_pupil_agent(
         yield _cached
         return
 
-    # --- Embed once, share vector across memory + context retrieval ---
     tool_name = _dispatch_tool(user_message, session_id)
-
-    shared_vector: list[float] = await _embed_fn(user_message, http_client)
 
     # Fetch memories (using shared vector) + history in parallel
     def _query_memories():
@@ -215,23 +230,24 @@ async def run_pupil_agent(
         )
         return list((results.get("documents") or [[]])[0])
 
-    import asyncio as _asyncio
-    prior_memories, history = await _asyncio.gather(
-        asyncio.get_event_loop().run_in_executor(None, _query_memories),
-        get_conversation_history_func(conversation_id, db),
-    )
-
-    # Resolve which lesson is active for this session so context retrieval can
-    # be scoped to that lesson's chunks only. Without this, the vector search
-    # ranks chunks from ALL uploaded lessons and may return content from a
-    # completely different lesson if it's semantically closer to the query.
-    active_lesson_id: int | None = None
-    if session_id is not None:
+    # Fetch memories (shared vector), history, and active lesson id in parallel.
+    # _query_memories uses ChromaDB (sync, runs in thread pool).
+    # get_conversation_history_func and the lesson query use the same DB session
+    # but are both lightweight SELECTs that queue safely on the aiosqlite backend.
+    async def _get_active_lesson_id() -> int | None:
+        if session_id is None:
+            return None
         from app.models.domain import Lesson as _Lesson
-        lesson_result = await db.execute(
+        result = await db.execute(
             select(_Lesson.id).where(_Lesson.session_id == session_id)
         )
-        active_lesson_id = lesson_result.scalar_one_or_none()
+        return result.scalar_one_or_none()
+
+    prior_memories, history, active_lesson_id = await asyncio.gather(
+        asyncio.get_event_loop().run_in_executor(None, _query_memories),
+        get_conversation_history_func(conversation_id, db),
+        _get_active_lesson_id(),
+    )
 
     context = ""
     try:
@@ -290,19 +306,10 @@ async def run_pupil_agent(
     lc_messages.append(HumanMessage(content=user_message))
 
     # Single LLM call — no ReAct loop, no tool schemas.
-    # temperature=0.7: higher than the teacher agent (0.4) so tutoring responses
-    # feel warm and naturally varied rather than robotically consistent.
-    llm = ChatOllama(
-        model=settings.ollama_model_pupil,
-        base_url=settings.ollama_base_url,
-        temperature=0.7,
-        streaming=True,
-    )
-
     full_response: list[str] = []
 
     try:
-        async for chunk in llm.astream(lc_messages):
+        async for chunk in _llm.astream(lc_messages):
             token = chunk.content
             if token:
                 full_response.append(token)
@@ -318,7 +325,10 @@ async def run_pupil_agent(
             await db.flush()
 
         try:
-            await _sem_cache.store(user_message, assistant_content, db, session_id=session_id)
+            await _sem_cache.store(
+                user_message, assistant_content, db,
+                session_id=session_id, vector=shared_vector,
+            )
         except Exception:
             logger.debug("Semantic cache store failed", exc_info=True)
 
