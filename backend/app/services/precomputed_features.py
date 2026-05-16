@@ -315,9 +315,16 @@ async def pre_answer_prompt_cards(
                 continue
 
             try:
-                # RAG: top-2 lesson chunks using the card's pre-computed trigger embedding.
+                # Embed the question text — this must match the vector
+                # pupil_graph.py computes when the pupil sends the same text,
+                # so the semantic cache lookup hits at sim≈1.0.
+                # (trigger_embedding is the embedding of trigger *phrases*,
+                # not the question, so using it would produce a low-sim miss.)
+                question_embedding = await ollama_client.embed(question)
+
+                # RAG: top-2 lesson chunks using the question embedding.
                 results = await asyncio.to_thread(
-                    lambda e=embedding: col.query(
+                    lambda e=question_embedding: col.query(
                         query_embeddings=[e],
                         n_results=2,
                         include=["documents"],
@@ -343,7 +350,7 @@ async def pre_answer_prompt_cards(
                     answer=answer,
                     db=db,
                     session_id=None,
-                    vector=embedding,
+                    vector=question_embedding,
                 )
                 await db.commit()  # Release the SQLite write lock before sleeping.
                 logger.info(
