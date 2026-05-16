@@ -36,6 +36,39 @@ PIP = (VENV / "Scripts" / "pip.exe") if IS_WINDOWS else (VENV / "bin" / "pip")
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _ensure_python311() -> None:
+    """If current interpreter is < 3.11, find a newer one and re-exec with it."""
+    if sys.version_info >= (3, 11):
+        return
+
+    # Try to find a suitable interpreter already on the machine
+    for candidate in ("python3.13", "python3.12", "python3.11"):
+        path = shutil.which(candidate)
+        if path:
+            _print(f"Switching to {candidate} ({path})...")
+            os.execv(path, [path] + sys.argv)
+            # os.execv replaces this process; never returns on success
+
+    # Nothing found — try Homebrew on macOS
+    if platform.system().lower() == "darwin" and shutil.which("brew"):
+        _print("Python 3.11+ not found. Auto-installing via Homebrew...", prefix="!!")
+        try:
+            subprocess.check_call(["brew", "install", "python@3.11"])
+        except subprocess.CalledProcessError:
+            pass
+        path = shutil.which("python3.11")
+        if path:
+            os.execv(path, [path] + sys.argv)
+
+    print(
+        f"ERROR: Python 3.11+ is required but this is {sys.version.split()[0]}.\n"
+        "       On macOS run:  brew install python@3.11\n"
+        "       Then retry:    python3.11 run.py install",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+
 def _print(msg: str, *, prefix: str = ">>") -> None:
     print(f"{prefix} {msg}", flush=True)
 
@@ -292,6 +325,7 @@ def cmd_start(prod: bool = False) -> None:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    _ensure_python311()
     if len(sys.argv) < 2 or sys.argv[1] not in ("install", "start"):
         print("Usage: python3 run.py install | start [--prod]", file=sys.stderr)
         sys.exit(1)
