@@ -105,13 +105,13 @@ ollama pull gemma4:e2b
 ollama pull nomic-embed-text
 
 # Install dependencies and build the static Pupil App
-python run.py install
+python3 run.py install
 ```
 
 ### 2. Launch the Ecosystem
 
 ```bash
-python run.py start
+python3 run.py start
 ```
 
 What `run.py` does:

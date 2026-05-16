@@ -3,9 +3,9 @@
 LoopLens Hub — setup and launcher script.
 
 Usage:
-    python run.py install   — install all dependencies, build Flutter pupil app, write .env
-    python run.py start     — launch backend + teacher frontend + pupil web app
-    python run.py start --prod  — same as above but with Next.js in production mode
+    python3 run.py install   — install all dependencies, build Flutter pupil app, write .env
+    python3 run.py start     — launch backend + teacher frontend + pupil web app
+    python3 run.py start --prod  — same as above but with Next.js in production mode
 """
 from __future__ import annotations
 
@@ -195,7 +195,7 @@ def cmd_install() -> None:
     _print("Next steps:")
     _print("  1. Ensure Ollama is running:  ollama serve")
     _print("  2. Pull models (first time):  ollama pull gemma4:e2b && ollama pull nomic-embed-text")
-    _print("  3. Start the hub:             python run.py start")
+    _print("  3. Start the hub:             python3 run.py start")
 
 
 def cmd_start(prod: bool = False) -> None:
@@ -203,7 +203,7 @@ def cmd_start(prod: bool = False) -> None:
 
     if not PYTHON.exists():
         print(
-            "ERROR: Virtual environment not found. Run 'python run.py install' first.",
+            "ERROR: Virtual environment not found. Run 'python3 run.py install' first.",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -211,7 +211,7 @@ def cmd_start(prod: bool = False) -> None:
     pupil_web_dir = PUPIL_APP / "build" / "web"
     if not (pupil_web_dir / "index.html").exists():
         print(
-            "ERROR: Pupil App web build not found. Run 'python run.py install' first.",
+            "ERROR: Pupil App web build not found. Run 'python3 run.py install' first.",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -293,7 +293,7 @@ def cmd_start(prod: bool = False) -> None:
 
 if __name__ == "__main__":
     if len(sys.argv) < 2 or sys.argv[1] not in ("install", "start"):
-        print("Usage: python run.py install | start [--prod]", file=sys.stderr)
+        print("Usage: python3 run.py install | start [--prod]", file=sys.stderr)
         sys.exit(1)
 
     command = sys.argv[1]
