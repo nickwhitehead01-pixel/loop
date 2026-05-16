@@ -345,6 +345,7 @@ async def pre_answer_prompt_cards(
                     session_id=None,
                     vector=embedding,
                 )
+                await db.commit()  # Release the SQLite write lock before sleeping.
                 logger.info(
                     "[pre-answer] Stored cache entry %d/%d for lesson %d: %.60s",
                     idx + 1, len(prompt_cards), lesson_id, question,
