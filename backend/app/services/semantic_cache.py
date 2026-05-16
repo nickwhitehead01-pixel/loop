@@ -45,49 +45,51 @@ async def lookup(
         vector = await ollama_client.embed(question)
     col = semantic_cache_col()
 
-    where_filter: dict | None = None
+    async def _query(where_filter: dict | None) -> str | None:
+        try:
+            kwargs: dict = {
+                "query_embeddings": [vector],
+                "n_results": 1,
+                "include": ["distances", "metadatas"],
+            }
+            if where_filter:
+                kwargs["where"] = where_filter
+            results = col.query(**kwargs)
+        except Exception:
+            logger.debug("SemanticCache lookup error — treating as miss", exc_info=True)
+            return None
+
+        distances = (results.get("distances") or [[]])[0]
+        metadatas = (results.get("metadatas") or [[]])[0]
+        if not distances or not metadatas:
+            return None
+
+        similarity = 1.0 - float(distances[0])
+        if similarity < threshold:
+            return None
+
+        meta = metadatas[0]
+        answer = meta.get("answer", "")
+        sqlite_id = meta.get("sqlite_id")
+        if sqlite_id:
+            await db.execute(
+                update(SemanticCache)
+                .where(SemanticCache.id == int(sqlite_id))
+                .values(hit_count=SemanticCache.hit_count + 1)
+            )
+            await db.flush()
+        logger.info("Semantic cache HIT (sim=%.3f): %.60s", similarity, question)
+        return answer
+
+    # First try session-scoped cache (live answers for this session).
+    # On a miss, fall back to the global cache which holds pre-generated
+    # prompt-card answers stored with session_id=None.
     if session_id is not None:
-        where_filter = {"session_id": str(session_id)}
+        result = await _query({"session_id": str(session_id)})
+        if result is not None:
+            return result
 
-    try:
-        kwargs: dict = {
-            "query_embeddings": [vector],
-            "n_results": 1,
-            "include": ["distances", "metadatas"],
-        }
-        if where_filter:
-            kwargs["where"] = where_filter
-        results = col.query(**kwargs)
-    except Exception:
-        # Collection empty or query error — treat as miss
-        logger.debug("SemanticCache lookup error — treating as miss", exc_info=True)
-        return None
-
-    distances = (results.get("distances") or [[]])[0]
-    metadatas = (results.get("metadatas") or [[]])[0]
-
-    if not distances or not metadatas:
-        return None
-
-    # ChromaDB cosine distance: 0 = identical, 1 = orthogonal
-    similarity = 1.0 - float(distances[0])
-    if similarity < threshold:
-        return None
-
-    meta = metadatas[0]
-    answer = meta.get("answer", "")
-    sqlite_id = meta.get("sqlite_id")
-
-    if sqlite_id:
-        await db.execute(
-            update(SemanticCache)
-            .where(SemanticCache.id == int(sqlite_id))
-            .values(hit_count=SemanticCache.hit_count + 1)
-        )
-        await db.flush()
-
-    logger.info("Semantic cache HIT (sim=%.3f): %.60s", similarity, question)
-    return answer
+    return await _query(None)
 
 
 async def store(
