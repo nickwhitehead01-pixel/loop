@@ -32,7 +32,7 @@ from sqlalchemy import or_, select
 from app.agents.teacher_rag import summarise_lesson
 from app.core.database import AsyncSessionLocal
 from app.models.domain import Lesson, LessonChunk
-from app.services.precomputed_features import precompute_features
+from app.services.precomputed_features import precompute_features, pre_answer_prompt_cards
 
 logger = logging.getLogger(__name__)
 
@@ -143,6 +143,14 @@ async def _try_precompute(lesson_id: int) -> None:
         logger.info(
             "Precompute worker: lesson %d done — glossary=%d, cards=%d",
             lesson_id, len(glossary), len(prompt_cards),
+        )
+        # Fire-and-forget: seed the semantic cache with pre-generated answers
+        # for each prompt card. The 2s inter-card sleep inside pre_answer_prompt_cards
+        # keeps Ollama's queue open for live pupil requests throughout.
+        asyncio.create_task(pre_answer_prompt_cards(lesson_id, prompt_cards))
+        logger.info(
+            "Precompute worker: triggered card pre-answer for lesson %d (%d cards)",
+            lesson_id, len(prompt_cards),
         )
 
 

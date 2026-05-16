@@ -23,7 +23,10 @@ import logging
 import uuid
 
 from app.core.config import settings
+from app.core.database import AsyncSessionLocal
 from app.services import ollama_client
+from app.services import semantic_cache
+from app.services.chroma_client import lesson_chunks_col
 
 logger = logging.getLogger(__name__)
 
@@ -254,6 +257,109 @@ async def generate_prompt_card_library(lesson_content: str) -> list[dict]:
         })
 
     return cards
+
+
+# ---------------------------------------------------------------------------
+# Pre-answer warm-up — seeds the semantic cache so prompt-card taps are instant
+# ---------------------------------------------------------------------------
+
+# Mirrors the BLUF format from pupil_graph._BASE_SYSTEM but without
+# per-pupil memory or slide-position blocks, since we don't know at
+# pre-compute time which pupil will tap the card.
+_CARD_ANSWER_SYSTEM = (
+    "You are a supportive personal AI tutor for a pupil with special educational needs. "
+    "A [CONTEXT] block containing lesson material will be provided — use it to anchor "
+    "your answers to what has been taught. "
+    "RESPONSE FORMAT — BLUF (Bottom Line Up Front): "
+    "Answer in exactly 2 sentences and no more than 30 words total. "
+    "State the direct answer first, then add one short supporting detail or encouragement. "
+    "Never use bullet points, headers, or lists."
+)
+
+_MAX_CHUNK_WORDS = 150  # same cap as pupil_graph._MAX_CHUNK_WORDS
+
+
+async def pre_answer_prompt_cards(
+    lesson_id: int,
+    prompt_cards: list[dict],
+    inter_card_sleep: float = 2.0,
+) -> None:
+    """Seed the semantic cache with a pre-generated answer for each prompt card.
+
+    Runs as a detached asyncio task after precompute_features completes.
+    A sleep of *inter_card_sleep* seconds is inserted between each Gemma call
+    so live pupil requests can interleave — Ollama queues FIFO, and a 2-second
+    gap is enough for a live request to slip through without noticeable delay.
+
+    Answers are stored with session_id=None (lesson-global), so all pupils
+    across all sessions for this lesson share the same pre-generated answer.
+    On any per-card failure the error is logged and that card is skipped;
+    the first pupil to tap that card will trigger a live LLM call instead,
+    which seeds the cache for everyone after.
+    """
+    if not prompt_cards:
+        return
+
+    logger.info(
+        "[pre-answer] Starting pre-answer for lesson %d (%d cards, %.1fs gap)",
+        lesson_id, len(prompt_cards), inter_card_sleep,
+    )
+
+    col = lesson_chunks_col()
+
+    async with AsyncSessionLocal() as db:
+        for idx, card in enumerate(prompt_cards):
+            question = card.get("question", "").strip()
+            embedding = card.get("trigger_embedding")
+            if not question or not embedding:
+                continue
+
+            try:
+                # RAG: top-2 lesson chunks using the card's pre-computed trigger embedding.
+                results = await asyncio.to_thread(
+                    lambda e=embedding: col.query(
+                        query_embeddings=[e],
+                        n_results=2,
+                        include=["documents"],
+                        where={"lesson_id": str(lesson_id)},
+                    )
+                )
+                rows = (results.get("documents") or [[]])[0]
+                rows = [" ".join(r.split()[:_MAX_CHUNK_WORDS]) for r in rows]
+                context = "\n\n---\n\n".join(rows)
+
+                user_message = question
+                if context:
+                    user_message = f"[CONTEXT]\n{context}\n\n{question}"
+
+                answer = await ollama_client.generate_full(
+                    messages=[{"role": "user", "content": user_message}],
+                    model=settings.ollama_model_pupil,
+                    system=_CARD_ANSWER_SYSTEM,
+                )
+
+                await semantic_cache.store(
+                    question=question,
+                    answer=answer,
+                    db=db,
+                    session_id=None,
+                    vector=embedding,
+                )
+                logger.info(
+                    "[pre-answer] Stored cache entry %d/%d for lesson %d: %.60s",
+                    idx + 1, len(prompt_cards), lesson_id, question,
+                )
+
+            except Exception:
+                logger.exception(
+                    "[pre-answer] Failed for card %d/%d (lesson %d): %.60s — skipping",
+                    idx + 1, len(prompt_cards), lesson_id, question,
+                )
+
+            # Yield Ollama's queue to live pupil requests between each card.
+            await asyncio.sleep(inter_card_sleep)
+
+    logger.info("[pre-answer] Finished lesson %d", lesson_id)
 
 
 # ---------------------------------------------------------------------------
