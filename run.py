@@ -3,9 +3,9 @@
 LoopLens Hub — setup and launcher script.
 
 Usage:
-    python run.py install   — install all dependencies, create data dirs, write .env
-    python run.py start     — launch backend (uvicorn) + frontend (npm run dev)
-    python run.py start --prod  — launch backend + frontend (npm start) in production mode
+    python run.py install   — install all dependencies, build Flutter pupil app, write .env
+    python run.py start     — launch backend + teacher frontend + pupil web app
+    python run.py start --prod  — same as above but with Next.js in production mode
 """
 from __future__ import annotations
 
@@ -20,6 +20,7 @@ from pathlib import Path
 ROOT = Path(__file__).parent.resolve()
 BACKEND = ROOT / "backend"
 FRONTEND = ROOT / "frontend"
+PUPIL_APP = ROOT / "pupil_app"
 VENV = BACKEND / ".venv"
 DATA_DIR = BACKEND / "data"
 CHROMA_DIR = DATA_DIR / "chroma"
@@ -95,6 +96,38 @@ def _write_env_if_missing() -> None:
     _print(f".env written to {ENV_FILE}")
 
 
+def _ensure_flutter() -> None:
+    """Check for Flutter SDK. On macOS, auto-install via Homebrew if missing."""
+    _print("Checking for Flutter SDK...")
+    if shutil.which("flutter"):
+        _print("Flutter SDK found.")
+        return
+
+    system = platform.system().lower()
+    if system == "darwin":
+        if shutil.which("brew"):
+            _print("Flutter not found. Auto-installing via Homebrew...", prefix="!!")
+            try:
+                subprocess.check_call(["brew", "install", "--cask", "flutter"])
+                _print("Flutter installed successfully.")
+            except subprocess.CalledProcessError:
+                print("ERROR: Failed to install Flutter via Homebrew. Please install manually.", file=sys.stderr)
+                print("       https://docs.flutter.dev/get-started/install/macos", file=sys.stderr)
+                sys.exit(1)
+        else:
+            print("ERROR: Flutter not found and Homebrew is not installed.", file=sys.stderr)
+            print("       Please install Flutter manually: https://docs.flutter.dev/get-started/install/macos", file=sys.stderr)
+            sys.exit(1)
+    elif system == "windows":
+        print("ERROR: Flutter not found.", file=sys.stderr)
+        print("       Please install Flutter manually: https://docs.flutter.dev/get-started/install/windows", file=sys.stderr)
+        sys.exit(1)
+    else:
+        print("ERROR: Flutter not found.", file=sys.stderr)
+        print("       Please install Flutter manually: https://docs.flutter.dev/get-started/install/linux", file=sys.stderr)
+        sys.exit(1)
+
+
 def _check_ollama() -> None:
     try:
         import urllib.request
@@ -138,6 +171,14 @@ def cmd_install() -> None:
     npm = "npm.cmd" if IS_WINDOWS else "npm"
     _run([npm, "install"], cwd=FRONTEND)
 
+    # Ensure Flutter is available, then build the pupil web app
+    _ensure_flutter()
+    _check_version(["flutter", "--version"], 3, 0, "Flutter")
+    _print("Fetching Pupil App dependencies...")
+    _run(["flutter", "pub", "get"], cwd=PUPIL_APP)
+    _print("Building Pupil App (web release)...")
+    _run(["flutter", "build", "web", "--release"], cwd=PUPIL_APP)
+
     # Create required directories
     for d in (DATA_DIR, CHROMA_DIR, UPLOADS_DIR):
         d.mkdir(parents=True, exist_ok=True)
@@ -154,7 +195,7 @@ def cmd_install() -> None:
     _print("Next steps:")
     _print("  1. Ensure Ollama is running:  ollama serve")
     _print("  2. Pull models (first time):  ollama pull gemma4:e2b && ollama pull nomic-embed-text")
-    _print("  3. Start the hub:             python setup.py start")
+    _print("  3. Start the hub:             python run.py start")
 
 
 def cmd_start(prod: bool = False) -> None:
@@ -162,7 +203,15 @@ def cmd_start(prod: bool = False) -> None:
 
     if not PYTHON.exists():
         print(
-            "ERROR: Virtual environment not found. Run 'python setup.py install' first.",
+            "ERROR: Virtual environment not found. Run 'python run.py install' first.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    pupil_web_dir = PUPIL_APP / "build" / "web"
+    if not (pupil_web_dir / "index.html").exists():
+        print(
+            "ERROR: Pupil App web build not found. Run 'python run.py install' first.",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -191,42 +240,50 @@ def cmd_start(prod: bool = False) -> None:
         cwd=str(FRONTEND),
     )
 
-    _print("")
-    _print("Hub running. Press Ctrl+C to stop both services.")
-    _print("  Backend:  http://localhost:8000")
-    _print("  Frontend: http://localhost:3000")
-    _print("  API docs: http://localhost:8000/docs")
+    _print("Starting Pupil App web server on http://localhost:8080 ...")
+    pupil_proc = subprocess.Popen(
+        [sys.executable, "-m", "http.server", "8080", "--directory", str(pupil_web_dir)],
+    )
+
+    separator = "=" * 50
+    print(f"\n{separator}")
+    print("  🎓 LOOPLENSE IS LIVE!")
+    print(separator)
+    print("  👨‍🏫  Teacher Hub:  http://localhost:3000")
+    print("  🎒  Pupil App:    http://localhost:8080  (open in Chrome)")
+    print("  ⚙️   Backend API:  http://localhost:8000/docs")
+    print(f"{separator}\n", flush=True)
 
     def _shutdown(sig, frame):
         _print("\nShutting down...")
-        frontend_proc.terminate()
-        backend_proc.terminate()
-        try:
-            frontend_proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            frontend_proc.kill()
-        try:
-            backend_proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            backend_proc.kill()
+        for proc in (frontend_proc, pupil_proc, backend_proc):
+            proc.terminate()
+        for proc in (frontend_proc, pupil_proc, backend_proc):
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
         sys.exit(0)
 
     signal.signal(signal.SIGINT, _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
 
-    # Wait for both processes; exit if either dies unexpectedly
+    # Wait for all processes; exit if any dies unexpectedly
+    import time
+    procs = {
+        "Backend": backend_proc,
+        "Frontend": frontend_proc,
+        "Pupil App": pupil_proc,
+    }
     while True:
-        be_rc = backend_proc.poll()
-        fe_rc = frontend_proc.poll()
-        if be_rc is not None:
-            _print(f"Backend exited with code {be_rc}. Stopping frontend.")
-            frontend_proc.terminate()
-            sys.exit(be_rc)
-        if fe_rc is not None:
-            _print(f"Frontend exited with code {fe_rc}. Stopping backend.")
-            backend_proc.terminate()
-            sys.exit(fe_rc)
-        import time
+        for name, proc in procs.items():
+            rc = proc.poll()
+            if rc is not None:
+                _print(f"{name} exited with code {rc}. Stopping all services.")
+                for other in procs.values():
+                    if other != proc:
+                        other.terminate()
+                sys.exit(rc)
         time.sleep(1)
 
 
@@ -236,7 +293,7 @@ def cmd_start(prod: bool = False) -> None:
 
 if __name__ == "__main__":
     if len(sys.argv) < 2 or sys.argv[1] not in ("install", "start"):
-        print("Usage: python setup.py install | start [--prod]", file=sys.stderr)
+        print("Usage: python run.py install | start [--prod]", file=sys.stderr)
         sys.exit(1)
 
     command = sys.argv[1]

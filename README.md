@@ -72,9 +72,55 @@ flowchart TB
 
 ---
 
-## Setup
+## Setup: The Bypass Orchestrator
 
-> _Setup instructions land here in the next pass._
+To run a 2-billion parameter model on standard school hardware without latency, we explicitly bypassed Docker to preserve 100% of the host machine's RAM and CPU for Gemma 4.
+
+To make testing completely frictionless, **the orchestrator pre-compiles the Flutter Pupil App for the web**. You do not need to set up mobile emulators to test the Edge-Mesh network.
+
+**Prerequisites:**
+- Python 3.11+
+- Node.js 18+
+- Ollama installed and running
+- *(macOS users: the setup script will automatically install Flutter via Homebrew if missing)*
+
+### 1. Initial Setup
+
+```bash
+git clone <repo-url>
+cd gemma-education-platform
+
+# Pull the required models to your local machine (first time only)
+ollama pull gemma4:e2b
+ollama pull nomic-embed-text
+
+# Install dependencies and build the static Pupil App
+python run.py install
+```
+
+### 2. Launch the Ecosystem
+
+```bash
+python run.py start
+```
+
+What `run.py` does:
+
+- Verifies the local environment and ports
+- Fires an asynchronous KV-Cache warmup request to Ollama to eliminate cold-start latency
+- Boots the FastAPI backend (port 8000)
+- Boots the Next.js Teacher Hub (port 3000)
+- Serves the pre-compiled Flutter Pupil App via a lightweight static server (port 8080)
+
+| Service | URL |
+|---|---|
+| 👨‍🏫 Teacher Hub | http://localhost:3000 |
+| 🎒 Pupil App | http://localhost:8080 (open in Chrome) |
+| ⚙️ Backend API docs | http://localhost:8000/docs |
+
+> **Testing the Pupil App**: Open http://localhost:8080 in Chrome. On the connect screen, enter Hub URL `http://localhost:8000` and any Pupil ID (e.g. `1`).
+
+Press **Ctrl+C** to stop all three services cleanly.
 
 
 ---
