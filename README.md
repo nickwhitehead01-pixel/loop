@@ -128,7 +128,9 @@ What `run.py` does:
 | 🎒 Pupil App | http://localhost:8080 (open in Chrome) |
 | ⚙️ Backend API docs | http://localhost:8000/docs |
 
-> **Testing the Pupil App**: Open http://localhost:8080 in Chrome. On the connect screen, enter Hub URL `http://localhost:8000` and any Pupil ID (e.g. `1`).
+> **Testing the Pupil App**: Open http://localhost:8080 in Chrome. On the connect screen, enter Hub URL `http://localhost:8000` and Pupil ID `2`.
+
+> **Sample lesson file**: A sample lesson is included at `samples/sample_lesson.pptx`. Upload it in the Teacher Hub to populate lesson content for testing.
 
 Press **Ctrl+C** to stop all three services cleanly.
 
