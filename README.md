@@ -86,10 +86,20 @@ To make testing completely frictionless, **the orchestrator pre-compiles the Flu
 
 ### 1. Initial Setup
 
+**Option A — from the zip file:**
 ```bash
-git clone <repo-url>
-cd gemma-education-platform
+unzip looplense-demo.zip
+cd looplense
+```
 
+**Option B — clone from GitHub:**
+```bash
+git clone https://github.com/nickwhitehead01-pixel/loop.git
+cd loop
+```
+
+**Then, for both options:**
+```bash
 # Pull the required models to your local machine (first time only)
 ollama pull gemma4:e2b
 ollama pull nomic-embed-text
