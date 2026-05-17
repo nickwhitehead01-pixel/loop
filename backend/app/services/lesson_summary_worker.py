@@ -32,7 +32,11 @@ from sqlalchemy import or_, select
 from app.agents.teacher_rag import summarise_lesson
 from app.core.database import AsyncSessionLocal
 from app.models.domain import Lesson, LessonChunk
-from app.services.precomputed_features import precompute_features, pre_answer_prompt_cards
+from app.services.precomputed_features import (
+    generate_glossary,
+    generate_prompt_cards_streaming,
+    pre_answer_prompt_cards,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -121,7 +125,28 @@ async def _try_precompute(lesson_id: int) -> None:
                 lesson.precomputed_features_attempts + 1,
                 PRECOMPUTE_MAX_ATTEMPTS,
             )
-            glossary, prompt_cards = await precompute_features(chunk_texts)
+            content = "\n\n".join(c for c in chunk_texts if c.strip())
+
+            # Run glossary concurrently with streaming card generation so
+            # both Gemma calls are in flight at the same time.
+            glossary_task = asyncio.create_task(generate_glossary(content))
+
+            # Stream cards one-by-one, persisting each to DB immediately so
+            # the SSE endpoint can forward it to the teacher's browser in
+            # real time — giving a visible sign of progress during the wait.
+            accumulated_cards: list[dict] = []
+            async for card in generate_prompt_cards_streaming(content):
+                accumulated_cards.append(card)
+                # Reassign (not mutate) so SQLAlchemy detects the change.
+                lesson.prompt_cards = list(accumulated_cards)
+                await db.commit()
+                logger.debug(
+                    "Precompute worker: lesson %d — card %d persisted (%s)",
+                    lesson_id, len(accumulated_cards), card.get("question", "")[:60],
+                )
+
+            glossary = await glossary_task
+
         except Exception:
             lesson.precomputed_features_attempts += 1
             await db.commit()
@@ -134,7 +159,9 @@ async def _try_precompute(lesson_id: int) -> None:
             return
 
         lesson.glossary = glossary
-        lesson.prompt_cards = prompt_cards
+        # prompt_cards already updated incrementally; reassign once more with
+        # the final list to ensure the last commit captured every card.
+        lesson.prompt_cards = list(accumulated_cards)
         lesson.precomputed_features_at = datetime.now(tz=timezone.utc)
         # Reset attempts on success — if the teacher later re-uploads or we
         # add a force-regenerate endpoint, this gets a clean slate.
@@ -142,15 +169,15 @@ async def _try_precompute(lesson_id: int) -> None:
         await db.commit()
         logger.info(
             "Precompute worker: lesson %d done — glossary=%d, cards=%d",
-            lesson_id, len(glossary), len(prompt_cards),
+            lesson_id, len(glossary), len(accumulated_cards),
         )
         # Fire-and-forget: seed the semantic cache with pre-generated answers
-        # for each prompt card. The 2s inter-card sleep inside pre_answer_prompt_cards
+        # for each prompt card. The inter-card sleep inside pre_answer_prompt_cards
         # keeps Ollama's queue open for live pupil requests throughout.
-        asyncio.create_task(pre_answer_prompt_cards(lesson_id, prompt_cards))
+        asyncio.create_task(pre_answer_prompt_cards(lesson_id, accumulated_cards))
         logger.info(
             "Precompute worker: triggered card pre-answer for lesson %d (%d cards)",
-            lesson_id, len(prompt_cards),
+            lesson_id, len(accumulated_cards),
         )
 
 

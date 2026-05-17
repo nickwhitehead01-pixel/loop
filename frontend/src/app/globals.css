@@ -199,6 +199,15 @@ html, body {
   to { transform: rotate(360deg); }
 }
 
+/* Prompt card phase-in — each card fades up as it arrives from the SSE stream. */
+.ll-card-appear {
+  animation: ll-card-appear 0.35s var(--ease) both;
+}
+@keyframes ll-card-appear {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0);   }
+}
+
 /* ---- Scrollbar (subtle) -------------------------------------------------- */
 ::-webkit-scrollbar { width: 6px; }
 ::-webkit-scrollbar-track { background: transparent; }

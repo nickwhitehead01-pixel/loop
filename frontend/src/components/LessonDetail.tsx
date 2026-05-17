@@ -1,5 +1,5 @@
 "use client";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import LessonProcessingStatus, { deriveLessonStage } from "./LessonProcessingStatus";
 
 const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
@@ -277,6 +277,70 @@ export default function LessonDetail({ lessonId, onBack }: Props) {
     return () => window.clearInterval(id);
   }, [data, load]);
 
+  // Progressive card streaming — open an SSE connection while the worker is
+  // in the preparing_features stage and surface each card the instant it
+  // lands in the DB, rather than waiting for the next 8s HTTP poll.
+  const [streamedCards, setStreamedCards] = useState<PromptCardPreview[]>([]);
+  const esRef = useRef<EventSource | null>(null);
+  // Keep a ref to the latest data so the SSE message handler can read it
+  // without capturing a stale closure.
+  const dataRef = useRef<LessonDetailData | null>(null);
+  dataRef.current = data;
+
+  useEffect(() => {
+    if (!data) return;
+    const stage = deriveLessonStage(data);
+
+    // Close any existing connection when we leave the preparing stage.
+    if (stage !== "preparing_features") {
+      if (esRef.current) {
+        esRef.current.close();
+        esRef.current = null;
+      }
+      return;
+    }
+
+    // Already connected — don't open a second connection.
+    if (esRef.current) return;
+
+    const es = new EventSource(`${API}/teacher/lessons/${data.id}/features/stream`);
+    esRef.current = es;
+
+    es.onmessage = (event: MessageEvent) => {
+      try {
+        const msg = JSON.parse(event.data as string) as {
+          type: string;
+          card?: PromptCardPreview;
+        };
+        if (msg.type === "card" && msg.card) {
+          setStreamedCards((prev) => [...prev, msg.card!]);
+        } else if (msg.type === "done" || msg.type === "failed") {
+          es.close();
+          esRef.current = null;
+          setStreamedCards([]);
+          load();
+        }
+      } catch {
+        // Ignore malformed frames — HTTP poll provides eventual consistency.
+      }
+    };
+
+    es.onerror = () => {
+      es.close();
+      esRef.current = null;
+      // Existing 8s HTTP poll continues as fallback.
+    };
+
+    return () => {
+      es.close();
+      esRef.current = null;
+    };
+  // data.id and data.precomputed_features_at are the only parts of data that
+  // should trigger re-subscribing; using the full data object would reopen
+  // the connection on every HTTP poll tick.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [data?.id, deriveLessonStage(data ?? { chunk_count: 0, summary: null, precomputed_features_at: null, precomputed_features_attempts: 0 }), load]);
+
   const copyLink = (f: LessonFile) => {
     const url = `${API}${f.url}`;
     navigator.clipboard.writeText(url).then(() => {
@@ -472,8 +536,15 @@ export default function LessonDetail({ lessonId, onBack }: Props) {
           </div>
 
           {/* Live-lesson features. Shows progress while the worker is
-              still building them, or previews once they're ready. */}
-          <LiveFeaturesSection data={data} onChange={setData} />
+              still building them, or previews once they're ready. Merges
+              any cards already streamed in via SSE so they appear one-by-one
+              as Gemma generates them, rather than all at once after the poll. */}
+          <LiveFeaturesSection
+            data={streamedCards.length > 0
+              ? { ...data, prompt_cards: streamedCards }
+              : data}
+            onChange={setData}
+          />
 
           {/* Indexed passages */}
           <div className="ll-card">
@@ -662,7 +733,7 @@ function LiveFeaturesSection({
 
       <FeatureSubsection
         title="Prompt cards"
-        emptyHint={data.prompt_card_count === 0
+        emptyHint={data.prompt_cards.length === 0
           ? "Gemma is drafting questions a pupil might naturally ask while you teach this."
           : null}
         stage={stage}
@@ -672,6 +743,7 @@ function LiveFeaturesSection({
             {data.prompt_cards.map((c, i) => (
               <div
                 key={c.id ?? i}
+                className="ll-card-appear"
                 style={{
                   padding: "10px 14px",
                   background: "var(--paper-shade)",

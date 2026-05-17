@@ -23,7 +23,7 @@ import re
 import time
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 import mimetypes
 from sqlalchemy import select, func as sa_func
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -438,6 +438,81 @@ async def regenerate_lesson_features(
     lesson.precomputed_features_attempts = 0
     await db.commit()
     return {"status": "queued"}
+
+
+@router.get("/lessons/{lesson_id}/features/stream")
+async def stream_lesson_features(lesson_id: int):
+    """Server-Sent Events stream for live prompt-card progress during precompute.
+
+    The client opens this endpoint while the lesson is in the
+    ``preparing_features`` stage.  The generator polls the DB every 1.5 s and
+    emits a ``card`` event for each newly-persisted card, a keep-alive comment
+    every 15 s, and a terminal ``done`` or ``failed`` event when the worker
+    finishes (or exhausts its retry budget).
+
+    Hard timeout: 5 minutes — long enough for any realistic lesson on local
+    hardware.  The client's existing 8-second HTTP poll acts as a fallback if
+    the SSE connection is dropped.
+    """
+    from app.services.lesson_summary_worker import PRECOMPUTE_MAX_ATTEMPTS
+
+    async def event_generator():
+        last_sent = 0
+        deadline = time.monotonic() + 300  # 5-minute hard stop
+        last_keepalive = time.monotonic()
+
+        while time.monotonic() < deadline:
+            async with AsyncSessionLocal() as db:
+                result = await db.execute(
+                    select(
+                        Lesson.prompt_cards,
+                        Lesson.precomputed_features_at,
+                        Lesson.precomputed_features_attempts,
+                    ).where(Lesson.id == lesson_id)
+                )
+                row = result.one_or_none()
+
+            if row is None:
+                yield "data: {\"type\":\"failed\"}\n\n"
+                return
+
+            cards, features_at, attempts = row
+            cards = cards or []
+
+            # Emit any cards the worker has committed since our last poll.
+            for card in cards[last_sent:]:
+                preview = {k: v for k, v in card.items() if k != "trigger_embedding"}
+                payload = json.dumps({"type": "card", "card": preview})
+                yield f"data: {payload}\n\n"
+                last_sent += 1
+
+            if features_at is not None:
+                yield "data: {\"type\":\"done\"}\n\n"
+                return
+
+            if attempts >= PRECOMPUTE_MAX_ATTEMPTS:
+                yield "data: {\"type\":\"failed\"}\n\n"
+                return
+
+            # Keep-alive comment so proxies don't close the connection.
+            now = time.monotonic()
+            if now - last_keepalive >= 15:
+                yield ":\n\n"
+                last_keepalive = now
+
+            await asyncio.sleep(1.5)
+
+        # Deadline reached without completion.
+        yield "data: {\"type\":\"failed\"}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @router.delete("/lessons/{lesson_id}", status_code=204)

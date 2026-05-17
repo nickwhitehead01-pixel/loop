@@ -21,6 +21,7 @@ import asyncio
 import json
 import logging
 import uuid
+from typing import AsyncIterator
 
 from app.core.config import settings
 from app.core.database import AsyncSessionLocal
@@ -191,6 +192,141 @@ _PROMPT_CARDS_PROMPT = (
     "Respond with ONLY this JSON (no other text):\n"
     '{{"cards": [{{"question": "...", "triggers": ["...", "..."]}}, ...]}}'
 )
+
+
+class _CardStreamParser:
+    """Character-level parser that detects complete card objects inside a
+    ``{"cards": [...]}`` token stream and yields each card as a raw JSON string.
+
+    Tracks string boundaries (including escape sequences) and brace depth so
+    that it correctly handles trigger phrases that contain any punctuation.
+    """
+
+    def __init__(self) -> None:
+        self._buf = ""
+        self._depth = 0
+        self._in_string = False
+        self._escape_next = False
+        self._in_cards_array = False
+        self._card_start: int = -1
+
+    def feed(self, token: str) -> list[str]:
+        """Append *token* to the internal buffer; return any newly-completed
+        card JSON strings (may be zero or more per call)."""
+        completed: list[str] = []
+        for ch in token:
+            result = self._process_char(ch)
+            if result is not None:
+                completed.append(result)
+        return completed
+
+    def _process_char(self, ch: str) -> str | None:
+        self._buf += ch
+
+        if self._escape_next:
+            self._escape_next = False
+            return None
+
+        if ch == "\\" and self._in_string:
+            self._escape_next = True
+            return None
+
+        if ch == '"':
+            self._in_string = not self._in_string
+            return None
+
+        if self._in_string:
+            return None
+
+        if ch == "[" and self._depth == 1:
+            # The array nested inside the top-level object — this is the cards list.
+            self._in_cards_array = True
+            return None
+
+        if ch == "{":
+            self._depth += 1
+            if self._in_cards_array and self._depth == 2:
+                # Opening brace of a new card object.
+                self._card_start = len(self._buf) - 1
+            return None
+
+        if ch == "}":
+            self._depth -= 1
+            if self._in_cards_array and self._depth == 1 and self._card_start != -1:
+                # Closing brace of a complete card object.
+                card_json = self._buf[self._card_start:]
+                self._card_start = -1
+                return card_json
+
+        return None
+
+
+async def generate_prompt_cards_streaming(
+    lesson_content: str,
+) -> AsyncIterator[dict]:
+    """Stream prompt cards one by one as Gemma generates them.
+
+    Uses the existing ``generate_stream`` Ollama call and a character-level
+    parser to detect card-object boundaries in the token stream.  Each
+    complete card is validated, embedded, and yielded before the next one
+    starts — allowing the background worker to persist each card to the DB
+    immediately so the SSE endpoint can push it to the UI in real time.
+
+    Fewer than ``_TARGET_PROMPT_CARD_COUNT[0]`` valid cards is acceptable
+    (Gemma may produce a shorter list for short lessons); the caller decides
+    whether to treat that as an error.
+    """
+    prompt = _PROMPT_CARDS_PROMPT.format(
+        min=_TARGET_PROMPT_CARD_COUNT[0],
+        max=_TARGET_PROMPT_CARD_COUNT[1],
+        content=lesson_content[:6000],
+    )
+    parser = _CardStreamParser()
+    card_index = 0
+
+    async for token in ollama_client.generate_stream(
+        messages=[{"role": "user", "content": prompt}],
+        model=settings.ollama_model_teacher,
+        system=_JSON_SYSTEM_PROMPT,
+        format="json",
+    ):
+        for card_json in parser.feed(token):
+            if card_index >= _TARGET_PROMPT_CARD_COUNT[1]:
+                return
+            try:
+                item = _repair_and_parse(card_json)
+            except (ValueError, json.JSONDecodeError):
+                logger.debug("[precompute-stream] skipping unparseable card fragment")
+                continue
+
+            if not isinstance(item, dict):
+                continue
+
+            question = str(item.get("question", "")).strip()
+            triggers_raw = item.get("triggers", [])
+            if not isinstance(triggers_raw, list):
+                continue
+            triggers = [str(t).strip() for t in triggers_raw if str(t).strip()]
+            if not question or not triggers:
+                continue
+
+            trigger_text = ". ".join(triggers)
+            try:
+                embedding = await ollama_client.embed(trigger_text)
+            except Exception:
+                logger.exception(
+                    "[precompute-stream] embed failed for card %d — skipping", card_index
+                )
+                continue
+
+            yield {
+                "id": f"card_{uuid.uuid4().hex[:8]}",
+                "question": question,
+                "triggers": triggers,
+                "color": _COLORS[card_index % len(_COLORS)],
+                "trigger_embedding": embedding,
+            }
+            card_index += 1
 
 
 async def generate_prompt_card_library(lesson_content: str) -> list[dict]:

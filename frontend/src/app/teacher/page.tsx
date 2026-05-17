@@ -463,6 +463,45 @@ function SessionsPanel({ teacherId }: { teacherId: number }) {
       });
   }, [teacherId]);
 
+  // On mount, try to resume any in-progress session so tab-switching or a
+  // page refresh doesn't orphan a session that's still open on the backend.
+  useEffect(() => {
+    const hint = typeof window !== "undefined"
+      ? window.localStorage.getItem("ll_active_session_id")
+      : null;
+
+    const resumeUrl = hint
+      ? `${API}/session/${hint}`
+      : `${API}/teacher/sessions?teacher_id=${teacherId}`;
+
+    void fetch(resumeUrl)
+      .then((r) => r.ok ? r.json() : Promise.reject(r.status))
+      .then((data: SessionInfo | SessionInfo[]) => {
+        const session = Array.isArray(data)
+          ? (data.find((s) => s.status !== "ended") ?? null)
+          : (data.status !== "ended" ? data : null);
+        if (!session) {
+          // Hint pointed to an ended session — clean it up.
+          if (hint) window.localStorage.removeItem("ll_active_session_id");
+          return;
+        }
+        activeSessionIdRef.current = session.id;
+        setActiveSession(session);
+        // Re-hydrate transcript display from persisted chunks.
+        void fetch(`${API}/session/${session.id}/transcript`)
+          .then((r) => r.json())
+          .then((chunks: TranscriptChunkResponse[]) => {
+            applyPersistedTranscript(session.id, chunks.map((c) => c.content));
+          })
+          .catch(console.error);
+      })
+      .catch(() => {
+        // Resume failed silently — teacher can open a new session normally.
+        if (hint) window.localStorage.removeItem("ll_active_session_id");
+      });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [teacherId]);
+
   useEffect(() => {
     return () => {
       const socket = socketRef.current;
@@ -638,6 +677,7 @@ function SessionsPanel({ teacherId }: { teacherId: number }) {
       activeSessionIdRef.current = session.id;
       setActiveSession(session);
       setLiveTranscripts([]);
+      window.localStorage.setItem("ll_active_session_id", String(session.id));
     } catch (e) {
       setSessionError(e instanceof Error ? e.message : "Could not open lesson.");
     } finally {
@@ -800,6 +840,7 @@ function SessionsPanel({ teacherId }: { teacherId: number }) {
       streamRef.current = null;
       activeSessionIdRef.current = null;
       setActiveSession(null);
+      window.localStorage.removeItem("ll_active_session_id");
       resetAudioPipeline();
     } catch (e) {
       console.error(e);

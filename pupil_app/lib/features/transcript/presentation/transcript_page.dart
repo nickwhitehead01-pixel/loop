@@ -99,6 +99,19 @@ class _TranscriptPageState extends State<TranscriptPage> {
   Timer? _replyTimeoutTimer;
   WaveformState _waveState = WaveformState.waiting;
 
+  // ── Accessible word-paced reveal ──────────────────────────────────────────
+  // Tokens from Ollama can arrive faster than a pupil with learning
+  // difficulties can read them.  We buffer the raw token stream and drip-feed
+  // complete word-units to the screen at a fixed interval so the pace is
+  // always comfortable regardless of how quickly the model is running.
+  // Both manual chat replies AND prompt-card answers flow through the same
+  // _chatSub path, so this fix covers both automatically.
+  static const Duration _kRevealInterval = Duration(milliseconds: 100);
+  final List<String> _tokenQueue = <String>[];
+  String _tokenBuffer = '';
+  bool _streamDone = false;
+  Timer? _revealTimer;
+
   @override
   void initState() {
     super.initState();
@@ -234,20 +247,46 @@ class _TranscriptPageState extends State<TranscriptPage> {
     _chatSub = stream.listen(
       (ChatStreamFrame frame) {
         if (!mounted) return;
-        setState(() {
-          _chatConnected = true;
-          final _Entry? streaming = _streamingHelperEntry();
-          if (frame.token.isNotEmpty && streaming != null) {
-            streaming.text += frame.token;
-          }
-          if (frame.done && streaming != null) {
-            streaming.isStreaming = false;
-            _awaitingChatReply = false;
-            _replyTimeoutTimer?.cancel();
-          }
-        });
-        // Helper tokens land in the right column, so scroll that one only.
-        _scrollToBottomSoon(_chatScroll);
+        // Mark connection live on first frame.
+        if (!_chatConnected) setState(() => _chatConnected = true);
+
+        if (frame.done) {
+          // Flush any partial word still sitting in the buffer.
+          final String remaining = _tokenBuffer.trimRight();
+          if (remaining.isNotEmpty) _tokenQueue.add(remaining);
+          _tokenBuffer = '';
+          _streamDone = true;
+          // Don't finalise the entry yet — let the reveal timer drain the
+          // queue first so the last words still appear at reading pace.
+          return;
+        }
+
+        // Accumulate the raw token and extract complete word-units.
+        // A word-unit is a run of non-whitespace followed by optional
+        // trailing spaces, so the pupil always sees a full word at each step.
+        _tokenBuffer += frame.token;
+        final RegExp wordBoundary = RegExp(r'\S+\s*');
+        final List<RegExpMatch> allMatches =
+            wordBoundary.allMatches(_tokenBuffer).toList();
+        if (allMatches.isEmpty) return;
+
+        // If the buffer doesn't end with whitespace the last match may be an
+        // incomplete word (mid-token split) — keep it in the buffer.
+        final bool endsWithSpace = _tokenBuffer.isNotEmpty &&
+            _tokenBuffer.codeUnitAt(_tokenBuffer.length - 1) <= 32;
+        final int completeCount =
+            endsWithSpace ? allMatches.length : allMatches.length - 1;
+
+        for (int i = 0; i < completeCount; i++) {
+          _tokenQueue.add(allMatches[i].group(0)!);
+        }
+        _tokenBuffer = completeCount < allMatches.length
+            ? allMatches.last.group(0)!
+            : '';
+
+        // Start the reveal timer if it isn't already running.
+        _revealTimer ??=
+            Timer.periodic(_kRevealInterval, _revealNextToken);
       },
       onError: (Object error) {
         if (!mounted) return;
@@ -307,10 +346,54 @@ class _TranscriptPageState extends State<TranscriptPage> {
     return null;
   }
 
+  // Called by the reveal timer: pops one word-unit from the queue and appends
+  // it to the currently-streaming helper entry.  When the queue is empty AND
+  // the Ollama stream has signalled done, the entry is finalised.
+  void _revealNextToken(Timer _) {
+    if (!mounted) {
+      _revealTimer?.cancel();
+      _revealTimer = null;
+      return;
+    }
+    final _Entry? streaming = _streamingHelperEntry();
+    if (streaming == null) {
+      // No active entry — reset everything and stop ticking.
+      _tokenQueue.clear();
+      _tokenBuffer = '';
+      _streamDone = false;
+      _revealTimer?.cancel();
+      _revealTimer = null;
+      return;
+    }
+
+    if (_tokenQueue.isNotEmpty) {
+      setState(() => streaming.text += _tokenQueue.removeAt(0));
+      _scrollToBottomSoon(_chatScroll);
+    } else if (_streamDone) {
+      // Queue drained and stream finished — finalise the turn.
+      setState(() {
+        streaming.isStreaming = false;
+        _awaitingChatReply = false;
+        _replyTimeoutTimer?.cancel();
+        _streamDone = false;
+      });
+      _revealTimer?.cancel();
+      _revealTimer = null;
+    }
+    // If neither branch: Ollama is still generating and the queue is
+    // temporarily empty — timer keeps ticking until the next batch arrives.
+  }
+
   void _onSend(String text) {
     if (!_chatConnected) {
       _connectChat();
     }
+    // Reset word-reveal state so each new reply starts from a clean queue.
+    _revealTimer?.cancel();
+    _revealTimer = null;
+    _tokenQueue.clear();
+    _tokenBuffer = '';
+    _streamDone = false;
     setState(() {
       _entries.add(_Entry(speaker: _Speaker.pupil, text: text));
       _entries.add(_Entry(speaker: _Speaker.helper, text: '', isStreaming: true));
@@ -358,6 +441,7 @@ class _TranscriptPageState extends State<TranscriptPage> {
 
   @override
   void dispose() {
+    _revealTimer?.cancel();
     _waveTimer?.cancel();
     _replyTimeoutTimer?.cancel();
     _transcriptSub?.cancel();
