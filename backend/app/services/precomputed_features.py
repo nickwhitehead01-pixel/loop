@@ -39,8 +39,8 @@ _COLORS = ["blue", "green", "amber"]
 # adult considers obvious* trips up 11-year-olds (especially those with
 # SEN). Better to flag a word the pupil already knows than miss one they
 # don't — they can just ignore the underline.
-_TARGET_GLOSSARY_SIZE = (30, 50)        # min, max — soft targets in the prompt
-_TARGET_PROMPT_CARD_COUNT = (8, 12)
+_TARGET_GLOSSARY_SIZE = (15, 25)        # min, max — soft targets in the prompt
+_TARGET_PROMPT_CARD_COUNT = (5, 8)
 
 
 # ---------------------------------------------------------------------------
@@ -142,7 +142,7 @@ async def generate_glossary(lesson_content: str) -> list[dict]:
     prompt = _GLOSSARY_PROMPT.format(
         min=_TARGET_GLOSSARY_SIZE[0],
         max=_TARGET_GLOSSARY_SIZE[1],
-        content=lesson_content[:16000],  # crude cap, fits comfortably in context
+        content=lesson_content[:6000],  # ~1000 words — enough for glossary, keeps inference fast
     )
     raw = await ollama_client.generate_full(
         messages=[{"role": "user", "content": prompt}],
@@ -204,7 +204,7 @@ async def generate_prompt_card_library(lesson_content: str) -> list[dict]:
     prompt = _PROMPT_CARDS_PROMPT.format(
         min=_TARGET_PROMPT_CARD_COUNT[0],
         max=_TARGET_PROMPT_CARD_COUNT[1],
-        content=lesson_content[:16000],
+        content=lesson_content[:6000],
     )
     raw = await ollama_client.generate_full(
         messages=[{"role": "user", "content": prompt}],
@@ -282,7 +282,7 @@ _MAX_CHUNK_WORDS = 150  # same cap as pupil_graph._MAX_CHUNK_WORDS
 async def pre_answer_prompt_cards(
     lesson_id: int,
     prompt_cards: list[dict],
-    inter_card_sleep: float = 2.0,
+    inter_card_sleep: float = 0.5,
 ) -> None:
     """Seed the semantic cache with a pre-generated answer for each prompt card.
 
