@@ -130,7 +130,11 @@ What `run.py` does:
 
 > **Testing the Pupil App**: Open http://localhost:8080 in Chrome. On the connect screen, enter Hub URL `http://localhost:8000` and Pupil ID `1`.
 
-> **Sample lesson file**: A sample lesson is included at `samples/additional-materials.docx`. Upload it in the Teacher Hub to populate lesson content for testing.
+> **Sample lesson file**: A sample lesson is included at `samples/additional-materials.docx`. Upload it in the Teacher Hub to populate lesson content for testing. 
+
+> **Sample lesson**: Once the document has upload, open a lesson. Select prompt cards and tappable words. Start a transcript and begin reading from the provided course material. You can then begin interacting with the pupil app. Finish the lesson with a quiz.
+
+
 
 Press **Ctrl+C** to stop all three services cleanly.
 
